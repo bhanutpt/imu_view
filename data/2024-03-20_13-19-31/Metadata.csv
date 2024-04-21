@@ -1,0 +1,2 @@
+version,device name,recording epoch time,recording time,recording timezone,platform,appVersion,device id,sensors,sampleRateMs,standardisation
+3,moto g54 5G,1710940771641,2024-03-20_13-19-31,Asia/Calcutta,android,1.31.0,dc974100-bf2f-407e-8466-e95622a174f4,Accelerometer|Gyroscope|Annotation|TotalAcceleration|GyroscopeUncalibrated|AccelerometerUncalibrated,50|50||50|50|50,false
