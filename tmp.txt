@@ -1,4 +1,5 @@
 
+
 # Import required modules.
 import numpy as np
 import time
@@ -6,330 +7,274 @@ import time
 # Import local modules.
 from mcrc16 import modbus_crc16 as crc16
 
-# Declare the general RX frame header data type.
-header_rx_t = np.dtype([('SOH', 'u1'), ('L', 'u1'), ('FT', 'u1'), ('CMD', 'u1'), ('ACK', 'u1')])
+# Declare the general TX frame header data type.
+header_tx_t = np.dtype([('SOH', 'u1'), ('L', 'u1'), ('FT', 'u1'), ('CMD', 'u1')])
 
-# Functions for constructing the rx frames.
-def get_rx_frame(SOH, L, FT, CMD, ACK, data_bytes):
+# Functions for constructing the tx frames.
+def get_tx_frame(SOH, L, FT, CMD, data_bytes):
     """
-    Constructs the frame by combining the frame header, data bytes, and CRC.    
+    Constructs the frame by combining the frame header, data bytes, and CRC.
     """
-    fr = np.array([(SOH, L, FT, CMD, ACK)], dtype=header_rx_t)
+    fr = np.array([(SOH, L, FT, CMD)], dtype=header_tx_t)
     header_bytes = fr.tobytes()
     crc = crc16(header_bytes + data_bytes)
     frame = header_bytes + data_bytes + crc.to_bytes(2, byteorder='big')
     return frame
 
-# Functions for constructing and parsing different RX frames.
-# Get MAC Address Rx Frame
-def get_mac_addr_rx_frame(data, ACK):
+# Functions for constructing the frames for different commands.
+# Get MAC Address - 0x01
+def get_mac_addr_frame(data):
     """
-    Constructs the MAC address Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+    Constructs the frame to get the MAC address of the device.
+    """
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x01
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Set Dog Collar position Rx Frame
-def set_dog_collar_pos_rx_frame(data, ACK):
+# Set dog collar position - 0x04
+# Valid range for data include 1 to 12.
+def set_dog_collar_pos_frame(data):
     """
-    Constructs the dog collar position Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+    Constructs the frame to set the dog collar position.
+    Valid range for data include 1 to 12.
+    """
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x04
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Get epoch real time clock in device Rx Frame
-def get_epoch_time_rx_frame(data, ACK):
+# Get epoch real time clock in device - 0x05
+def get_epoch_time_frame(data):
     """
-    Constructs the epoch real time clock in device Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+    Constructs the frame to get the epoch real time clock in the device.
+    """
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x05
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Set epoch real time clock in device Rx Frame
-def set_epoch_time_rx_frame(data, ACK):
+# Set epoch real time clock in device - 0x06
+def set_epoch_time_frame(data):
+    """ 
+    Constructs the frame to set the epoch real time clock in the device.
     """
-    Constructs the epoch real time clock in device Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x06
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Start/Stop Continuous Recording Session (BLE Offline) Rx Frame
-def start_stop_cont_rec_session_rx_frame(data, ACK):
-    """
-    Constructs the start/stop continuous recording session (BLE Offline) Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Start/Stop Continuous Recording Session (BLE Offline) - 0x07
+# 0 to Stop, 1 to Start
+def start_stop_cont_rec_sess_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x07
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Start/Stop activity data harvesting Rx Frame
-def start_stop_act_data_harvest_rx_frame(data, ACK):
-    """
-    Constructs the start/stop activity data harvesting Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Start/Stop activity data harvesting - 0x08
+# 0 to Stop, 1 to Start
+def start_stop_act_data_harvest_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x08
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Start/Stop periodic dashbord status information Rx Frame
-def start_stop_periodic_dash_info_rx_frame(data, ACK):
-    """
-    Constructs the start/stop periodic dashbord status information Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Start/Stop periodic dashbord status information - 0x09
+# 0 to Stop, 1 to Start
+def start_stop_periodic_dash_info_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x09
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# BLE status show Rx Frame
-def ble_status_show_rx_frame(data, ACK):
-    """
-    Constructs the BLE status show Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# BLE status show command - 0x0A
+def ble_status_show_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x0A
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# BLE connected show Rx Frame
-def ble_connected_show_rx_frame(data, ACK):
-    """
-    Constructs the BLE connected show Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+ # BLE connected show command - 0x0B
+def ble_connected_show_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x0B
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Factory reset Rx Frame
-def factory_reset_rx_frame(data, ACK):
-    """
-    Constructs the factory reset Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Factory reset command - 0x0C   
+def factory_reset_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x0C
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Reboot Rx Frame
-def reboot_rx_frame(data, ACK):
-    """
-    Constructs the reboot Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Reboot command - 0x0D
+def reboot_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x0D
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Start/Stop recording session rx frame
-def start_stop_rec_sess_rx_frame(data, ACK):
-    """
-    Constructs the start/stop recording session Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Start/Stop recording session - 0x10
+# 0 to Stop, 1 to Start
+# Session UID should be part of the data.
+def start_stop_rec_sess_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x10
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Read recording session details rx frame
-def read_rec_sess_details_rx_frame(data, ACK):
-    """
-    Constructs the read recording session details Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Read recording session details (raw data records) - 0x11
+# Session UID should be part of the data.
+def read_rec_sess_details_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x11
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Read recording session data rx frame
-def read_rec_sess_data_rx_frame(data, ACK):
-    """
-    Constructs the read recording session data Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Read recording session data (raw record data) - 0x12
+# Session UID should be part of the data.
+# Raw record number should be part of the data.
+def read_rec_sess_data_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x12
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Read recording session details (activity data records) rx frame
-def read_rec_sess_act_details_rx_frame(data, ACK):
-    """
-    Constructs the read recording session details (activity data records) Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Read recording session details (activity data records) - 0x13
+# Session UID should be part of the data.
+def read_rec_sess_act_details_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x13
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Read recording session data (activity record data) rx frame
-def read_rec_sess_act_data_rx_frame(data, ACK):
-    """
-    Constructs the read recording session data (activity record data) Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Read recording session data (activity record data) - 0x14
+# Session UID should be part of the data.
+# Activity record number should be part of the data.
+def read_rec_sess_act_data_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x14
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)    
 
-# Read device log info rx frame
-def read_dev_log_info_rx_frame(data, ACK):
-    """
-    Constructs the read device log info Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Read device log info - 0x15
+# Log number should be part of the data.
+def read_dev_log_info_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x15
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Read dashboard info rx frame
-def read_dash_info_rx_frame(data, ACK):
-    """
-    Constructs the read dashboard info Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Read dashboard info - 0x16
+def read_dash_info_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x16
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Start/Stop BLE live activity session rx frame
-def start_stop_ble_live_act_sess_rx_frame(data, ACK):
-    """
-    Constructs the start/stop BLE live activity session Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Start/Stop BLE live activity session command - 0x17
+# 0 to Stop, 1 to Start
+def start_stop_ble_live_act_sess_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x17
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Start/Stop BLE live raw IMU recording (IMU raw data) rx frame
-def start_stop_ble_live_raw_imu_rec_rx_frame(data, ACK):
-    """
-    Constructs the start/stop BLE live raw IMU recording (IMU raw data) Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Start/Stop BLE live raw IMU recording command (IMU raw data) - 0x18
+# 0 to Stop, 1 to Start
+def start_stop_ble_live_raw_imu_rec_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x18
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)    
 
-# Start Dsico light rx frame
-def start_disco_light_rx_frame(data, ACK):
-    """
-    Constructs the start disco light Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Start Disco light command - 0x19
+def start_disco_light_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x19
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Set dog size rx frame
-def set_dog_size_rx_frame(data, ACK):
-    """
-    Constructs the set dog size Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Set dog size command - 0x1A
+# Dog size should be part of the data. 
+def set_dog_size_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x1A
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Get Continuous Recording Session Status rx frame
-def get_cont_rec_sess_status_rx_frame(data, ACK):
-    """
-    Constructs the get continuous recording session status Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Get Continuous Recording Session Status - 0x1B
+def get_cont_rec_sess_status_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x1B
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Read Continuous Recording Session Details rx frame
-def read_cont_rec_sess_details_rx_frame(data, ACK):
-    """
-    Constructs the read continuous recording session details Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Read Continuous Recording Session Details - 0x1C
+def read_cont_rec_sess_details_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x1C
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Read raw data chunk rx frame
-def read_raw_data_chunk_rx_frame(data, ACK):
-    """
-    Constructs the read raw data chunk Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Read Raw Data Chunk - 0x1D
+def read_raw_data_chunk_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x1D
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Delete raw data chunk rx frame
-def delete_raw_data_chunk_rx_frame(data, ACK):
-    """
-    Constructs the delete raw data chunk Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Delete Raw data chunk - 0x1E
+def delete_raw_data_chunk_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x1E
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    return get_tx_frame(SOH, L, FT, CMD, data)
 
-# Delete recording session rx frame
-def delete_rec_sess_rx_frame(data, ACK):
-    """
-    Constructs the delete recording session Rx frame.
-    """    
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
+# Delete recording session - 0x1F
+def delete_rec_sess_frame(data):
+    SOH = 0x01
+    L = len(data) + 6
+    FT = 0xF1
     CMD = 0x1F
-    return get_rx_frame(SOH, L, FT, CMD, ACK, data)      
+    return get_tx_frame(SOH, L, FT, CMD, data)
+
 
 # Testing the module when the file run in standalone mode.
 if __name__ == "__main__":  
+    data = bytes.fromhex('00')  
+    b_str = get_mac_addr_frame(data)
 
-    # Construct a sample RX frame
-    # Create a variable with 6 byte mac address in bytes
-    data = bytes.fromhex('01 02 03 0A 0B 0C')
-    SOH = 0x02
-    L = len(data) + 7
-    FT = 0xF2
-    CMD = 0x01
-    ACK = 0x11
-    rx_b_str = get_rx_frame(SOH, L, FT, CMD, ACK, data)
-
-    hex_str = ' '.join(format(x, '02x') for x in rx_b_str)
+    # Print the frame in hex format.
+    hex_str = ' '.join(format(x, '02x') for x in b_str)
     print(hex_str)
+
+
