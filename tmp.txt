@@ -1,35 +1,313 @@
 
+# Module to parse rx frames.
 
-'''
-MODBUS CRC16 calculation.
-'''
+# Import required modules.
+import numpy as np
+import time
 
-def modbus_crc16(data):
-    """
-    Calculates the Modbus CRC16 checksum for a given byte array.
+# Import local modules.
+from mcrc16 import modbus_crc16 as crc16
 
-    :param data: the byte array for which to calculate the checksum
-    :type data: bytes
-    :return: the calculated checksum
-    :rtype: int
-    """
-    crc = 0xFFFF
-    for b in data:
-        crc ^= b
-        for _ in range(8):
-            if crc & 0x0001:
-                crc >>= 1
-                crc ^= 0xA001
-            else:
-                crc >>= 1
-    return crc
+from . import tx
+from . import rx
 
-if __name__ == "__main__":
-    in_fr = bytes.fromhex("0107F10100")
-    crc_16 = modbus_crc16(in_fr)
-    print(hex(crc_16))
-    # b = crc_16.to_bytes(2, byteorder='big')
-    # print(hex(b[0]))
-     
+# Declare the general RX frame header data type.
+header_rx_t = np.dtype([('SOH', 'u1'), ('L', 'u1'), ('FT', 'u1'), ('CMD', 'u1'), ('ACK', 'u1')])
 
+# Command list
+CMD_GET_MAC_ADDR = 0x01
+CMD_SET_DOG_COLLAR_POS = 0x04
+CMD_GET_EPOCH_TIME = 0x05
+CMD_SET_EPOCH_TIME = 0x06
+CMD_START_STOP_CONT_REC_SESSION = 0x07
+CMD_START_STOP_ACT_DATA_HARVEST = 0x08
+#CMD_START_STOP_PERIODIC_DASH_INFO = 0x09
+CMD_BLE_STATUS_SHOW = 0x0A
+CMD_BLE_CONNECTED_SHOW = 0x0B
+CMD_FACTORY_RESET = 0x0C
+CMD_REBOOT = 0x0D
+CMD_START_STOP_REC_SESS = 0x10
+CMD_READ_REC_SESS_DETAILS = 0x11
+CMD_READ_REC_SESS_DATA = 0x12
+CMD_READ_REC_SESS_ACT_DETAILS = 0x13
+CMD_READ_REC_SESS_ACT_DATA = 0x14
+CMD_READ_DEV_LOG_INFO  = 0x15
+CMD_READ_DASH_INFO = 0x16
+CMD_START_STOP_BLE_LIVE_ACT_SESS = 0x17
+CMD_START_STOP_BLE_LIVE_RAW_IMU_REC = 0x18
+CMD_DISCO_LIGHT = 0x19
+CMD_SET_DOG_SIZE = 0x1A
+CMD_CONT_REC_SESS_STATUS = 0x1B
+CMD_READ_CONT_REC_SESS_DETAILS = 0x1C
+CMD_READ_RAW_DATA_CHUNK = 0x1D
+CMD_DELETE_RAW_DATA_CHUNK = 0x1E
+CMD_DELETE_REC_SESS = 0x1F
+
+# Data structures for the respective commands rx data.
+# Get MAC Address - 0x01, RX frame data type.
+get_mac_addr_data_t = np.dtype([('MAC', 'u1', 6)])
+# Set Dog Collar position - 0x04, RX frame data type.
+set_dog_collar_pos_data_t = np.dtype([('D0', 'u1')])
+# Get epoch real time clock in device - 0x05, RX frame data type.
+get_epoch_time_data_t = np.dtype([('EPOCH', '>u8')])
+# Set epoch real time clock in device - 0x06, RX frame data type.
+set_epoch_time_data_t = np.dtype([('D0', 'u1')])
+# Start/Stop Continuous Recording Session - 0x07, RX frame data type.
+start_stop_cont_rec_sess_data_t = np.dtype([('D0', 'u1')])
+# Start/Stop Activity Data Harvest - 0x08, RX frame data type.
+start_stop_act_data_harvest_data_t = np.dtype([('D0', 'u1')])
+# Start/Stop Periodic Dash Info - 0x09, RX frame data type.
+#start_stop_periodic_dash_info_data_t = np.dtype([('D0', 'u1')])
+# BLE Status Show - 0x0A, RX frame data type.
+ble_status_show_data_t = np.dtype([('D0', 'u1')])
+# BLE Connected Show - 0x0B, RX frame data type.
+ble_connected_show_data_t = np.dtype([('D0', 'u1')])
+# Factory Reset - 0x0C, RX frame data type.
+factory_reset_data_t = np.dtype([('D0', 'u1')])
+# Reboot - 0x0D, RX frame data type.
+reboot_data_t = np.dtype([('D0', 'u1')])
+# Start/Stop Recording Session - 0x10, RX frame data type.
+start_stop_rec_sess_data_t = np.dtype([('D0', 'u1')])
+# Read Recording Session Details - 0x11, RX frame data type.
+read_rec_sess_details_data_t = np.dtype([('TS', '>u8'), ('RECORDS', '>u2')])
+# Read Recording Session Act Data - 0x13, RX frame data type.
+read_rec_sess_details_act_data_t = np.dtype([('TS', '>u8'), ('RECORDS', '>u2')])
+
+def parse_get_mac_addr_data(data):
+    # Validate the data length
+    if len(data) != get_mac_addr_data_t.itemsize:
+        print("Parsing failed: Incorrect data length")
+        return None
     
+    # Parse the data
+    try:
+        fr = np.frombuffer(data, count=1, dtype=get_mac_addr_data_t)
+        
+        # Check if the parsing was successful
+        if fr is not None and fr.size == 1:
+            print("Parsing successful:", fr)
+            return fr
+        else:
+            print("Parsing failed: Empty or incorrect structure")
+            return None
+    except Exception as e:
+        print("Parsing failed with exception:", e)
+        return None
+
+def parse_set_dog_collar_pos_data(data):
+    # Validate the data length
+    if len(data) != set_dog_collar_pos_data_t.itemsize:
+        print("Parsing failed: Incorrect data length")
+        return None
+    
+    # Parse the data
+    try:
+        fr = np.frombuffer(data, count=1, dtype=set_dog_collar_pos_data_t)
+        
+        # Check if the parsing was successful
+        if fr is not None and fr.size == 1:
+            print("Parsing successful:", fr)
+            return fr
+        else:
+            print("Parsing failed: Empty or incorrect structure")
+            return None
+    except Exception as e:
+        print("Parsing failed with exception:", e)
+        return None
+
+def parse_get_epoch_time_data(data):
+    # Validate the data length
+    if len(data) != get_epoch_time_data_t.itemsize:
+        print("Parsing failed: Incorrect data length")
+        return None
+    
+    # Parse the data
+    try:
+        fr = np.frombuffer(data, count=1, dtype=get_epoch_time_data_t)
+        
+        # Check if the parsing was successful
+        if fr is not None and fr.size == 1:
+            print("Parsing successful:", fr)
+            return fr
+        else:
+            print("Parsing failed: Empty or incorrect structure")
+            return None
+    except Exception as e:
+        print("Parsing failed with exception:", e)
+        return None
+
+def parse_set_epoch_time_data(data):
+    # Validate the data length
+    if len(data) != set_epoch_time_data_t.itemsize:
+        print("Parsing failed: Incorrect data length")
+        return None
+    
+    # Parse the data
+    try:
+        fr = np.frombuffer(data, count=1, dtype=set_epoch_time_data_t)
+        
+        # Check if the parsing was successful
+        if fr is not None and fr.size == 1:
+            print("Parsing successful:", fr)
+            return fr
+        else:
+            print("Parsing failed: Empty or incorrect structure")
+            return None
+    except Exception as e:
+        print("Parsing failed with exception:", e)
+        return None
+
+def parse_start_stop_cont_rec_sess_data(data):
+    # Validate the data length
+    if len(data) != start_stop_cont_rec_sess_data_t.itemsize:
+        print("Parsing failed: Incorrect data length")
+        return None
+    
+    # Parse the data
+    try:
+        fr = np.frombuffer(data, count=1, dtype=start_stop_cont_rec_sess_data_t)
+        
+        # Check if the parsing was successful
+        if fr is not None and fr.size == 1:
+            print("Parsing successful:", fr)
+            return fr
+        else:
+            print("Parsing failed: Empty or incorrect structure")
+            return None
+    except Exception as e:
+        print("Parsing failed with exception:", e)
+        return None
+
+def parse_read_rec_sess_details_data(data):
+    # Validate the data length
+    if len(data) != read_rec_sess_details_data_t.itemsize:
+        print("Parsing failed: Incorrect data length")
+        return None
+    
+    # Parse the data
+    try:
+        fr = np.frombuffer(data, count=1, dtype=read_rec_sess_details_data_t)
+        
+        # Check if the parsing was successful
+        if fr is not None and fr.size == 1:
+            print("Parsing successful:", fr)
+            return fr
+        else:
+            print("Parsing failed: Empty or incorrect structure")
+            return None
+    except Exception as e:
+        print("Parsing failed with exception:", e)
+        return None
+
+def parse_read_rec_sess_details_act_data(data):
+    # Validate the data length
+    if len(data) != read_rec_sess_details_act_data_t.itemsize:
+        print("Parsing failed: Incorrect data length")
+        return None
+    
+    # Parse the data
+    try:
+        fr = np.frombuffer(data, count=1, dtype=read_rec_sess_details_act_data_t)
+        
+        # Check if the parsing was successful
+        if fr is not None and fr.size == 1:
+            print("Parsing successful:", fr)
+            return fr
+        else:
+            print("Parsing failed: Empty or incorrect structure")
+            return None
+    except Exception as e:
+        print("Parsing failed with exception:", e)
+        return None
+
+
+# Function to parse the RX frame.                   
+def parse_rx_frame(frame):
+
+    # Validate the minimum frame length
+    if len(frame) < 5:
+        print("Parsing failed: Less then minimum frame length")
+        return None
+    
+    # Validate CRC
+    header_bytes = frame[:-2]
+    crc = crc16(header_bytes)
+    if crc.to_bytes(2, byteorder='big') != frame[-2:]:
+        print("Parsing failed: Incorrect CRC")
+        return None
+    
+    # Parse the header
+    try:
+        header = np.frombuffer(frame, count=1, dtype=header_rx_t)
+        
+        # Check if the parsing was successful
+        if header is not None and header.size == 1:
+            pass
+        else:
+            print("Parsing failed: Empty or incorrect structure")
+            return None
+    except Exception as e:
+        print("Parsing failed with exception:", e)
+        return None 
+    print("Header:", header)
+
+    # Check SOH
+    if header['SOH'][0] != 0x02:
+        print("Parsing failed: Incorrect SOH")
+        return None
+    
+    # Check the frame length
+    if len(frame) != header['L'][0]:
+        print("Parsing failed: Frame length in response does not match with response length")
+        return None
+    
+    # Check the frame type
+    if header['FT'][0] != 0xF2:
+        print("Parsing failed: Incorrect frame type")
+        return None
+    
+    # Check ACK
+    if header['ACK'][0] != 0x11:
+        print("Parsing failed: Incorrect ACK")
+        return None
+    
+    # Check the command
+    cmd = header['CMD'][0]
+    
+    # Extract the data bytes
+    data_bytes = frame[5:-2]
+    
+    # Parse the data based on the command
+    if cmd == CMD_GET_MAC_ADDR:
+        return parse_get_mac_addr_data(data_bytes)
+    elif cmd == CMD_SET_DOG_COLLAR_POS:
+        return parse_set_dog_collar_pos_data(data_bytes)  
+    elif cmd == CMD_GET_EPOCH_TIME:
+        return parse_get_epoch_time_data(data_bytes)  
+    elif cmd == CMD_SET_EPOCH_TIME:
+        return parse_set_epoch_time_data(data_bytes) 
+    elif cmd == CMD_START_STOP_CONT_REC_SESSION:
+        return parse_start_stop_cont_rec_sess_data(data_bytes)
+    elif cmd == CMD_READ_REC_SESS_DETAILS:
+        return parse_read_rec_sess_details_data(data_bytes)
+    elif cmd == CMD_READ_REC_SESS_ACT_DETAILS:
+        return parse_read_rec_sess_details_act_data(data_bytes)
+
+
+# Testing the module when the file run in standalone mode.
+if __name__ == "__main__":  
+
+    # Construct a sample RX frame
+    # Create a variable with 6 byte mac address in bytes
+    data = bytes.fromhex('01 02 03 0A 0B 0C')
+    SOH = 0x02
+    L = len(data) + 7
+    FT = 0xF2
+    CMD = 0x01
+    ACK = 0x11
+    rx_b_str = rx.get_rx_frame(SOH, L, FT, CMD, ACK, data)
+    # Change a byte in the frame to test the CRC
+    #rx_b_str = rx_b_str[:5] + bytes([0x12]) + rx_b_str[6:] 
+    parsed_frame = parse_rx_frame(rx_b_str)
+    # hex_str = ' '.join(format(x, '02x') for x in rx_b_str)
+    # print(hex_str)
