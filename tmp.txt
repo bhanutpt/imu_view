@@ -1,7 +1,145 @@
 
+//***************************************************************************************
+//  MSP430 Low Power Mode with GPIO Wake-up
+//
+//  Description: Blink LED 10 times, then enter LPM3. Wake up on button press.
+//  Buttons are active-low (press pulls pin to ground).
+//  ACLK = n/a, MCLK = SMCLK = default DCO
+//
+//                MSP430FR5735
+//             -----------------
+//         /|\|              XIN|-
+//          | |                 |
+//          --|RST          XOUT|-
+//            |                 |
+//            |             P2.7|-->FAULT_LED
+//            |             P2.3|<--BR_UP_SW (button)
+//            |             P2.4|<--BR_DOWN_SW (button)
+//            |             P3.0|<--HR_DOWN_SW (button)
+//            |             P3.1|<--HR_UP_SW (button)
+//
+//  Modified: October 2025
+//***************************************************************************************
 
-def get_hexstring_from_bytes(data):
-    """
-    Converts the bytes data to a hex string.
-    """
-    return ' '.join(format(x, '02x') for x in data)
+#include "msp430fr5735.h"
+
+#define FAULT_LED BIT7
+#define HR_DRV_FAULT BIT2
+#define HR_DRV_SLEEP BIT5
+#define BR_DRV_FAULT BIT3
+#define BR_DRV_SLEEP BIT6
+#define HR_FORWARD_ACT BIT2
+#define HR_REVERSE_ACT BIT3
+#define BR_FORWARD_ACT BIT4
+#define BR_REVERSE_ACT BIT5
+#define TESTING BIT0
+
+// Button definitions (GPIO inputs - Active LOW)
+#define BR_UP_SW BIT3       // P2.3
+#define BR_DOWN_SW BIT4     // P2.4
+#define HR_UP_SW BIT1       // P3.1
+#define HR_DOWN_SW BIT0     // P3.0
+
+volatile unsigned int i;   // volatile to prevent optimization
+
+void Board_Initialize(void)
+{
+    // HR Driver Configuration
+    P3DIR &= ~HR_DRV_FAULT;                 // P3.2 Input
+    P2DIR |= HR_DRV_SLEEP;                  // P2.5 Output
+    P3REN |= HR_DRV_FAULT;                  // Enable resistor
+    P3OUT |= HR_DRV_FAULT;                  // Select Pull-Up
+    P2OUT |= HR_DRV_SLEEP;                  // Making HR Sleep Pin High
+    P1DIR |= HR_FORWARD_ACT + HR_REVERSE_ACT;   // P1.2 and P1.3 as output
+
+    // BR Driver Configuration
+    P3DIR &= ~BR_DRV_FAULT;                 // P3.3 Input
+    P2DIR |= BR_DRV_SLEEP;                  // P2.6 Output
+    P2DIR |= FAULT_LED;                     // P2.7 Output LED
+    P3REN |= BR_DRV_FAULT;                  // Enable resistor
+    P3OUT |= BR_DRV_FAULT;                  // Select Pull-Up
+    P2OUT |= BR_DRV_SLEEP;                  // Making BR Sleep Pin High
+    P2OUT &= ~FAULT_LED;                    // Sets LED LOW
+    P1DIR |= BR_FORWARD_ACT + BR_REVERSE_ACT;   // P1.4 and P1.5 as output
+
+    // ACLK output for testing
+    P2DIR |= TESTING;                       // OUTPUT ACLK on P2.0
+    P2SEL1 |= TESTING;
+    P2SEL0 |= TESTING;
+
+    // Configure button inputs on Port 2 (P2.3, P2.4) as GPIO with pull-ups
+    P2DIR &= ~(BR_UP_SW | BR_DOWN_SW);      // Set as inputs
+    P2REN |= (BR_UP_SW | BR_DOWN_SW);       // Enable pull resistors
+    P2OUT |= (BR_UP_SW | BR_DOWN_SW);       // Select pull-up (buttons pull to ground when pressed)
+
+    // Configure button inputs on Port 3 (P3.0, P3.1) as GPIO with pull-ups
+    P3DIR &= ~(HR_UP_SW | HR_DOWN_SW);      // Set as inputs
+    P3REN |= (HR_UP_SW | HR_DOWN_SW);       // Enable pull resistors
+    P3OUT |= (HR_UP_SW | HR_DOWN_SW);       // Select pull-up (buttons pull to ground when pressed)
+
+    // Configure Port 2 interrupt for wake-up (P2.3, P2.4)
+    P2IES |= (BR_UP_SW | BR_DOWN_SW);       // Interrupt on high-to-low transition (button press)
+    P2IFG &= ~(BR_UP_SW | BR_DOWN_SW);      // Clear interrupt flags
+    P2IE |= (BR_UP_SW | BR_DOWN_SW);        // Enable interrupts
+
+    // Configure Port 3 interrupt for wake-up (P3.0, P3.1)
+    P3IES |= (HR_UP_SW | HR_DOWN_SW);       // Interrupt on high-to-low transition (button press)
+    P3IFG &= ~(HR_UP_SW | HR_DOWN_SW);      // Clear interrupt flags
+    P3IE |= (HR_UP_SW | HR_DOWN_SW);        // Enable interrupts
+}
+
+// Port 2 interrupt service routine - wakes up MCU from LPM3
+#pragma vector=PORT2_VECTOR
+__interrupt void Port_2(void)
+{
+    P2IFG &= ~(BR_UP_SW | BR_DOWN_SW);      // Clear interrupt flags
+    __bic_SR_register_on_exit(LPM3_bits);   // Exit LPM3 on interrupt return
+}
+
+// Port 3 interrupt service routine - wakes up MCU from LPM3
+#pragma vector=PORT3_VECTOR
+__interrupt void Port_3(void)
+{
+    P3IFG &= ~(HR_UP_SW | HR_DOWN_SW);      // Clear interrupt flags
+    __bic_SR_register_on_exit(LPM3_bits);   // Exit LPM3 on interrupt return
+}
+
+void main(void) {
+    WDTCTL = WDTPW | WDTHOLD;               // Stop watchdog timer
+    PM5CTL0 &= ~LOCKLPM5;                   // Disable the GPIO power-on default high-impedance mode
+                                            // to activate previously configured port settings
+
+    Board_Initialize();                     // Initialize board GPIO
+
+    __enable_interrupt();                   // Enable global interrupts
+
+    unsigned int blink_count = 0;
+
+    for(;;) {
+        // Blink LED 10 times
+        for(blink_count = 0; blink_count < 10; blink_count++) {
+            P2OUT |= FAULT_LED;             // Turn LED ON
+            for(i = 0; i < 50000; i++);     // Software delay (~0.5 sec)
+
+            P2OUT &= ~FAULT_LED;            // Turn LED OFF
+            for(i = 0; i < 50000; i++);     // Software delay (~0.5 sec)
+        }
+
+        // Turn off LED before sleep
+        P2OUT &= ~FAULT_LED;
+
+        // Clear any pending interrupt flags before entering sleep
+        P2IFG &= ~(BR_UP_SW | BR_DOWN_SW);
+        P3IFG &= ~(HR_UP_SW | HR_DOWN_SW);
+
+        // Enter LPM3 (Low Power Mode 3) with interrupts enabled
+        // CPU and MCLK are stopped, ACLK remains active
+        __bis_SR_register(LPM3_bits + GIE);
+
+        // MCU wakes up here when any button is pressed
+        // Small delay to debounce button
+        for(i = 0; i < 10000; i++);
+
+        // Continue to next iteration (blink again for 10 times)
+    }
+}
