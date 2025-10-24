@@ -1,10 +1,12 @@
 
 //***************************************************************************************
-//  MSP430 Low Power Mode with GPIO Wake-up
+//  MSP430 Low Power Mode with ADC-Based Switch Detection
 //
 //  Description: Blink LED 10 times, then enter LPM3. Wake up on button press.
-//  Buttons are active-low (press pulls pin to ground).
-//  ACLK = n/a, MCLK = SMCLK = default DCO
+//  Buttons use resistor divider (10k ohms) that pulls VCC to VCC/2 when pressed.
+//  ADC12_B (10-bit) monitors 4 channels with threshold detection (~50% VCC).
+//  Timer_B triggers periodic ADC sampling while in LPM3 for ultra-low power.
+//  ACLK = VLO (~10kHz), MCLK = SMCLK = default DCO
 //
 //                MSP430FR5735
 //             -----------------
@@ -13,10 +15,10 @@
 //          --|RST          XOUT|-
 //            |                 |
 //            |             P2.7|-->FAULT_LED
-//            |             P2.3|<--BR_UP_SW (button)
-//            |             P2.4|<--BR_DOWN_SW (button)
-//            |             P3.0|<--HR_DOWN_SW (button)
-//            |             P3.1|<--HR_UP_SW (button)
+//            |             P2.3|<--BR_UP_SW (ADC A11, analog input)
+//            |             P2.4|<--BR_DOWN_SW (ADC A12, analog input)
+//            |             P3.0|<--HR_DOWN_SW (ADC A8, analog input)
+//            |             P3.1|<--HR_UP_SW (ADC A9, analog input)
 //
 //  Modified: October 2025
 //***************************************************************************************
@@ -34,13 +36,29 @@
 #define BR_REVERSE_ACT BIT5
 #define TESTING BIT0
 
-// Button definitions (GPIO inputs - Active LOW)
-#define BR_UP_SW BIT3       // P2.3
-#define BR_DOWN_SW BIT4     // P2.4
-#define HR_UP_SW BIT1       // P3.1
-#define HR_DOWN_SW BIT0     // P3.0
+// Button definitions (ADC inputs - Analog resistor divider)
+#define BR_UP_SW BIT3       // P2.3 -> ADC A11
+#define BR_DOWN_SW BIT4     // P2.4 -> ADC A12
+#define HR_UP_SW BIT1       // P3.1 -> ADC A9
+#define HR_DOWN_SW BIT0     // P3.0 -> ADC A8
 
-volatile unsigned int i;   // volatile to prevent optimization
+// ADC threshold values for VCC/2 detection (10-bit ADC)
+// Pressed state: VCC/2 ≈ 512 (50% of 1024)
+// Threshold window: 40-60% to account for resistor tolerance
+#define ADC_THRESHOLD_LOW   410     // 40% of full scale (1024)
+#define ADC_THRESHOLD_HIGH  614     // 60% of full scale (1024)
+
+// ADC sampling period using Timer_B and ACLK (~10kHz VLO)
+#define ADC_SAMPLE_PERIOD   1000    // ~100ms at 10kHz ACLK
+
+volatile unsigned int i;                    // volatile to prevent optimization
+volatile unsigned int adc_results[4];       // Store ADC results for 4 channels
+volatile unsigned char button_pressed = 0;  // Flag for button detection
+
+// Channel order (sparse set): A8, A9, A11, A12
+static const unsigned short adc_channels[4] = { ADC10INCH_8, ADC10INCH_9, ADC10INCH_11, ADC10INCH_12 };
+volatile unsigned char adc_idx = 0;      // 0..3 which channel we're on in this batch
+volatile unsigned char adc_batch_cnt = 0; // samples taken in current batch
 
 void Board_Initialize(void)
 {
@@ -67,42 +85,100 @@ void Board_Initialize(void)
     P2SEL1 |= TESTING;
     P2SEL0 |= TESTING;
 
-    // Configure button inputs on Port 2 (P2.3, P2.4) as GPIO with pull-ups
+    // Configure button inputs as ADC channels (analog inputs)
+    // P2.3 (A11) and P2.4 (A12) - disable digital I/O, enable analog
     P2DIR &= ~(BR_UP_SW | BR_DOWN_SW);      // Set as inputs
-    P2REN |= (BR_UP_SW | BR_DOWN_SW);       // Enable pull resistors
-    P2OUT |= (BR_UP_SW | BR_DOWN_SW);       // Select pull-up (buttons pull to ground when pressed)
+    P2SEL0 |= (BR_UP_SW | BR_DOWN_SW);      // Select ADC function
+    P2SEL1 |= (BR_UP_SW | BR_DOWN_SW);      // Select ADC function
 
-    // Configure button inputs on Port 3 (P3.0, P3.1) as GPIO with pull-ups
+    // P3.0 (A8) and P3.1 (A9) - disable digital I/O, enable analog
     P3DIR &= ~(HR_UP_SW | HR_DOWN_SW);      // Set as inputs
-    P3REN |= (HR_UP_SW | HR_DOWN_SW);       // Enable pull resistors
-    P3OUT |= (HR_UP_SW | HR_DOWN_SW);       // Select pull-up (buttons pull to ground when pressed)
-
-    // Configure Port 2 interrupt for wake-up (P2.3, P2.4)
-    P2IES |= (BR_UP_SW | BR_DOWN_SW);       // Interrupt on high-to-low transition (button press)
-    P2IFG &= ~(BR_UP_SW | BR_DOWN_SW);      // Clear interrupt flags
-    P2IE |= (BR_UP_SW | BR_DOWN_SW);        // Enable interrupts
-
-    // Configure Port 3 interrupt for wake-up (P3.0, P3.1)
-    P3IES |= (HR_UP_SW | HR_DOWN_SW);       // Interrupt on high-to-low transition (button press)
-    P3IFG &= ~(HR_UP_SW | HR_DOWN_SW);      // Clear interrupt flags
-    P3IE |= (HR_UP_SW | HR_DOWN_SW);        // Enable interrupts
+    P3SEL0 |= (HR_UP_SW | HR_DOWN_SW);      // Select ADC function
+    P3SEL1 |= (HR_UP_SW | HR_DOWN_SW);      // Select ADC function
 }
 
-// Port 2 interrupt service routine - wakes up MCU from LPM3
-#pragma vector=PORT2_VECTOR
-__interrupt void Port_2(void)
+void ADC_Initialize(void)
 {
-    P2IFG &= ~(BR_UP_SW | BR_DOWN_SW);      // Clear interrupt flags
-    __bic_SR_register_on_exit(LPM3_bits);   // Exit LPM3 on interrupt return
+    ADC10CTL0 &= ~ADC10ENC;                           // disable to configure
+    ADC10CTL0 = ADC10SHT_2 | ADC10ON;                 // 16 ADC10CLK S&H, ADC on
+    ADC10CTL1 = ADC10SHP | ADC10CONSEQ_0;             // use sampling timer, single-channel mode
+    ADC10CTL2 = ADC10RES;                             // 10-bit
+    ADC10MCTL0 = adc_channels[0];                     // start on first channel (VR+=AVCC, VR-=AVSS default)
+    ADC10IE = ADC10IE0;                               // interrupt when MEM0 ready
+    ADC10IFG = 0;
+    ADC10CTL0 |= ADC10ENC;                            // enable conversions
 }
 
-// Port 3 interrupt service routine - wakes up MCU from LPM3
-#pragma vector=PORT3_VECTOR
-__interrupt void Port_3(void)
+
+
+void Timer_Initialize(void)
 {
-    P3IFG &= ~(HR_UP_SW | HR_DOWN_SW);      // Clear interrupt flags
-    __bic_SR_register_on_exit(LPM3_bits);   // Exit LPM3 on interrupt return
+//    // Configure ACLK to use VLO (~10kHz) for low power operation
+//    CSCTL4 = SELMS__DCOCLKDIV |                 // MCLK = SMCLK = DCO
+//             SELA__VLOCLK;                       // ACLK = VLO (~10kHz)
+
+    // Route ACLK = VLO (~10 kHz) on UCS
+    UCSCTL4 = (UCSCTL4 & ~SELA_7) | SELA__VLOCLK;
+
+
+    // Configure Timer_B0 for periodic ADC triggering
+    TB0CTL = TBSSEL__ACLK |                     // Timer source = ACLK (VLO ~10kHz)
+             MC__UP |                            // Up mode
+             TBCLR;                              // Clear timer
+
+    TB0CCR0 = ADC_SAMPLE_PERIOD;                // Set period (~100ms at 10kHz)
+    TB0CCTL0 = CCIE;                            // Enable TB0 CCR0 interrupt
 }
+
+#pragma vector=TIMER0_B0_VECTOR
+__interrupt void Timer_B0_ISR(void)
+{
+    if (!(ADC10CTL1 & ADC10BUSY) && adc_batch_cnt == 0) {
+        adc_idx = 0;
+        ADC10MCTL0 = adc_channels[adc_idx];           // select first channel
+        ADC10CTL0 |= ADC10SC;                         // start first conversion
+    }
+    // CCR0 flag auto-clears
+}
+
+
+#pragma vector=ADC10_VECTOR
+__interrupt void ADC10_ISR(void)
+{
+    switch (__even_in_range(ADC10IV, ADC10IV_ADC10IFG)) {
+    case ADC10IV_ADC10IFG: {                          // one conversion complete in MEM0
+        unsigned short val = ADC10MEM0;
+        adc_results[adc_idx] = val;
+
+        adc_idx++;
+        adc_batch_cnt++;
+
+        if (adc_batch_cnt < 4) {
+            // set up next channel and start next conversion
+            ADC10MCTL0 = adc_channels[adc_idx];
+            ADC10CTL0 |= ADC10SC;
+        } else {
+            // batch complete: check thresholds across the 4 readings
+            adc_batch_cnt = 0;
+            button_pressed = 0;
+            for (i = 0; i < 4; i++) {
+                if (adc_results[i] >= ADC_THRESHOLD_LOW && adc_results[i] <= ADC_THRESHOLD_HIGH) {
+                    button_pressed = 1;
+                    break;
+                }
+            }
+            if (button_pressed) {
+                __bic_SR_register_on_exit(LPM3_bits); // wake main
+            }
+        }
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+
 
 void main(void) {
     WDTCTL = WDTPW | WDTHOLD;               // Stop watchdog timer
@@ -110,6 +186,8 @@ void main(void) {
                                             // to activate previously configured port settings
 
     Board_Initialize();                     // Initialize board GPIO
+    ADC_Initialize();                       // Initialize ADC12_B for switch detection
+    Timer_Initialize();                     // Initialize Timer_B0 for periodic sampling
 
     __enable_interrupt();                   // Enable global interrupts
 
@@ -128,12 +206,13 @@ void main(void) {
         // Turn off LED before sleep
         P2OUT &= ~FAULT_LED;
 
-        // Clear any pending interrupt flags before entering sleep
-        P2IFG &= ~(BR_UP_SW | BR_DOWN_SW);
-        P3IFG &= ~(HR_UP_SW | HR_DOWN_SW);
+        // Clear button pressed flag before entering sleep
+        button_pressed = 0;
 
         // Enter LPM3 (Low Power Mode 3) with interrupts enabled
-        // CPU and MCLK are stopped, ACLK remains active
+        // Timer_B0 continues running from ACLK (VLO)
+        // Timer ISR triggers ADC conversions periodically
+        // ADC ISR wakes MCU if button threshold detected
         __bis_SR_register(LPM3_bits + GIE);
 
         // MCU wakes up here when any button is pressed
