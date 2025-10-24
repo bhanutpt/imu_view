@@ -1,4 +1,5 @@
 
+
 //***************************************************************************************
 //  MSP430 Low Power Mode with ADC-Based Switch Detection
 //
@@ -113,21 +114,43 @@ void ADC_Initialize(void)
 
 void Timer_Initialize(void)
 {
-//    // Configure ACLK to use VLO (~10kHz) for low power operation
-//    CSCTL4 = SELMS__DCOCLKDIV |                 // MCLK = SMCLK = DCO
-//             SELA__VLOCLK;                       // ACLK = VLO (~10kHz)
+    /* Clean, standalone Timer_B0 initialization for MSP430FR5735.
+     * Objective: Periodic interrupt (CCR0) every ~100 ms to start an ADC batch.
+     * Clock source: ACLK sourced from VLO (~10 kHz) for ultra‑low power.
+     * Previous code referenced UCSCTL4 (not present on FR57xx) causing build errors.
+     * This routine reconfigures only what we need and avoids touching unrelated clock bits.
+     */
 
-    // Route ACLK = VLO (~10 kHz) on UCS
-    UCSCTL4 = (UCSCTL4 & ~SELA_7) | SELA__VLOCLK;
+    /* 1. Ensure ACLK uses VLO.
+     * On FR57xx devices the Clock System (CS) registers are used (not UCS).
+     * We briefly unlock CS, select VLO for ACLK, then lock again.
+     * NOTE: If other code later reconfigures clocks, it must preserve SELA bits.
+     */
+    CSCTL0_H = CSKEY >> 8;                 // Unlock CS registers
+    // Preserve existing SELS/SELM; just force SELA = VLO.
+    CSCTL2 = (CSCTL2 & ~SELA_7) | SELA__VLOCLK;  // ACLK = VLO (~10 kHz)
+    CSCTL0_H = 0;                           // Lock CS registers
 
+    /* 2. Stop & clear Timer_B0 before configuring (defensive reset). */
+    TB0CTL = 0;                             // Halt timer, all settings cleared
+    TB0R = 0;                               // Reset counter register
+    TB0CCTL0 = 0;                           // Clear CCR0 control (also clears CCIFG)
 
-    // Configure Timer_B0 for periodic ADC triggering
-    TB0CTL = TBSSEL__ACLK |                     // Timer source = ACLK (VLO ~10kHz)
-             MC__UP |                            // Up mode
-             TBCLR;                              // Clear timer
+    /* 3. Set period. In up mode timer counts 0..CCR0 inclusive.
+     * Using ADC_SAMPLE_PERIOD (1000) at ~10 kHz gives ~100 ms.
+     * If exact 100 ms is required, confirm actual VLO frequency tolerance (~±15%).
+     */
+    TB0CCR0 = ADC_SAMPLE_PERIOD - 1;        // Adjust for inclusive count (optional)
 
-    TB0CCR0 = ADC_SAMPLE_PERIOD;                // Set period (~100ms at 10kHz)
-    TB0CCTL0 = CCIE;                            // Enable TB0 CCR0 interrupt
+    /* 4. Enable CCR0 interrupt, select ACLK, up mode, clear TAR. */
+    TB0CCTL0 = CCIE;                        // Interrupt enabled on CCR0 match
+    TB0CTL = TBSSEL__ACLK |                 // ACLK source (now VLO)
+             MC__UP |                       // Up mode
+             TBCLR;                         // Clear and start
+
+    /* 5. Clear any stray flags (defensive). */
+    TB0CCTL0 &= ~CCIFG;                     // Ensure CCR0 IFG is cleared
+    TB0CTL &= ~TBIFG;                       // Clear overflow IFG (not used)
 }
 
 #pragma vector=TIMER0_B0_VECTOR
