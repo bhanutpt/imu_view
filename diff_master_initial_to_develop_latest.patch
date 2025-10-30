@@ -1,0 +1,2050 @@
+diff --git a/.gitignore b/.gitignore
+index c28dfef..fbfb2f1 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -9,3 +9,27 @@
+ *.s37
+ *.rps
+ GNU ARM v12.2.1 - Default/
++
++# Build outputs
++build/
++output/
++Debug/
++Release/
++.venv/
++*.elf
++*.bin
++*.hex
++*.srec
++*.lst
++
++# Logs and temporary files
++*.log
++*.tmp
++*.bak
++*.swp
++*.swo
++*.orig
++
++# Python cache
++__pycache__/
++*.py[cod]
+diff --git a/.vscode/settings.json b/.vscode/settings.json
+index db4424a..a5a37fb 100644
+--- a/.vscode/settings.json
++++ b/.vscode/settings.json
+@@ -40,6 +40,7 @@
+         "ble_common.h": "c",
+         "wifi_app.h": "c",
+         "sl_board_configuration.h": "c",
+-        "spa06_003.h": "c"
++        "spa06_003.h": "c",
++        "sl_main_kernel.h": "c"
+     }
+ }
+\ No newline at end of file
+diff --git a/app.c b/app.c
+index 88b0542..ff7e142 100644
+--- a/app.c
++++ b/app.c
+@@ -35,6 +35,7 @@
+ #include "cmsis_os2.h"
+ #include "sl_utility.h"
+ #include "app.h"
++#include "sl_status.h"
+ 
+ #include "app_log.h"
+ #include "common_i2c.h"
+@@ -76,6 +77,7 @@ static int32_t prev_heap = -1;
+ // Function prototypes
+ extern void wifi_app_task(void);
+ sl_wifi_firmware_version_t catcollar_firmware_version = { 0 }; // Keep available for BLE version characteristic
++#define ENABLE_WIFI_STACK 1
+ 
+ const osThreadAttr_t thread_attributes = {
+   .name       = "application_thread",
+@@ -98,6 +100,7 @@ void application(void *argument)
+   prev_heap = xPortGetFreeHeapSize();
+   app_log_info("Init Free heap size: %d bytes\r\n", prev_heap);
+ 
++#if ENABLE_WIFI_STACK
+   //! Wi-Fi initialization
+   status = rsi_wifi_task_init();
+   if (status != SL_STATUS_OK) {
+@@ -111,6 +114,7 @@ void application(void *argument)
+   } else {
+     print_firmware_version(&catcollar_firmware_version);
+   }
++#endif
+ 
+   app_log_info("\r\n");
+   app_log_info(" \\ | /\r\n");
+@@ -142,10 +146,12 @@ LOG_HEAP_DELTA(5);
+ 
+   platform_i2c_init();
+   lsm6dsv_init();
+-  // spa06_init();
+-  // sy6105_init();
+-  // bmm350_init();
+-  // mlx90632_init();
++  spa06_init();
++  bmm350_init();
++  sl_status_t ir_status = mlx90632_init();
++  if (ir_status != SL_STATUS_OK) {
++    app_log_error("MLX90632 init failed (0x%lX)\r\n", (uint32_t)ir_status);
++  }
+   // spi_flash_test();
+   
+   // shellPortInit();
+diff --git a/filesystem/storage_api.c b/filesystem/storage_api.c
+index 7d704e8..bc50b0f 100644
+--- a/filesystem/storage_api.c
++++ b/filesystem/storage_api.c
+@@ -248,6 +248,12 @@ int storage_write_raw_imu_record(file_handle_t handle, raw_imu_record_t raw_reco
+ 		app_log_error("FAIL: write %s: %d\r\n", handle->imu_filename, ret);
+ 		erase_and_reboot();
+ 		return -1;
++	} else if (ret != sizeof(raw_record)) {
++		app_log_error("FAIL: partial write %s: wrote=%d expected=%u\r\n",
++		              handle->imu_filename,
++		              ret,
++		              (unsigned int)sizeof(raw_record));
++		return -1;
+ 	}
+ 	return 0;
+ }
+@@ -741,4 +747,4 @@ int storage_get_wifi_credentials(char *ssid_buf, char *password_buf)
+     app_log_info("Retrieved WiFi: SSID='%s' (%d), PWD='%s' (%d)\r\n", 
+                 ssid_buf, ssid_len, password_buf, pwd_len);
+     return 0;
+-}
+\ No newline at end of file
++}
+diff --git a/filesystem/storage_api.h b/filesystem/storage_api.h
+index 601eb48..67630c3 100644
+--- a/filesystem/storage_api.h
++++ b/filesystem/storage_api.h
+@@ -11,8 +11,15 @@
+ #define MAX_PATH_LEN (256)
+ #define MAX_OPEN_FILES (1)
+ 
+-#define RAW_FRAMES_PER_RECORD 	(10)
+-#define BLIP_SAMPLE_INTERVAL 	(50)
++#define RAW_FRAMES_PER_RECORD     (10)
++#define BLIP_SAMPLE_INTERVAL      (50)
++#define RAW_IMU_RECORD_VERSION    (2U)
++
++#define RAW_RECORD_AUX_FLAG_PRESSURE     (1U << 0)
++#define RAW_RECORD_AUX_FLAG_PRESS_TEMP   (1U << 1)
++#define RAW_RECORD_AUX_FLAG_MAGNETOMETER (1U << 2)
++#define RAW_RECORD_AUX_FLAG_IR_OBJECT    (1U << 3)
++#define RAW_RECORD_AUX_FLAG_IR_AMBIENT   (1U << 4)
+ 
+ extern fs_mount_t fs_mount_cat;
+ 
+@@ -28,9 +35,20 @@ typedef struct __attribute__((__packed__)) {
+ // ChekrAppLink API sends raw data as a 252-byte record,
+ // containing 10 samples per record
+ typedef struct __attribute__((__packed__)) {
+-	uint32_t record_num;										// 4 bytes		
+-	uint64_t timestamp; // currentmillis						// 4 bytes
+-	raw_imu_data_frame_t raw_data[RAW_FRAMES_PER_RECORD];		// 10*18 = 180 bytes
++	uint32_t version;                 // record layout identifier
++	uint32_t record_num;              // monotonically increasing record id
++	uint64_t base_timestamp_ms;       // unix time in milliseconds for sample[0]
++	raw_imu_data_frame_t raw_data[RAW_FRAMES_PER_RECORD];
++	uint64_t aux_timestamp_ms;        // timestamp for auxiliary snapshot
++	int32_t pressure_pa_x10;          // spa06 pressure in 0.1 Pa units
++	int16_t pressure_temp_cC;         // spa06 temperature in 0.01 °C
++	int16_t ir_object_temp_cC;        // MLX90632 object temperature in 0.01 °C
++	int16_t ir_ambient_temp_cC;       // MLX90632 ambient temperature in 0.01 °C
++	int16_t mag_uT_x;                 // BMM350 X in 0.01 µT
++	int16_t mag_uT_y;                 // BMM350 Y in 0.01 µT
++	int16_t mag_uT_z;                 // BMM350 Z in 0.01 µT
++	uint16_t aux_flags;               // RAW_RECORD_AUX_FLAG_* bits
++	uint16_t reserved;                // future use / alignment
+ } raw_imu_record_t;
+ 
+ // typedef struct __attribute__((__packed__)) {
+@@ -76,4 +94,4 @@ int storage_delete_cont_rec_chunk_file(char *basename);
+ int storage_save_wifi_credentials(const char *ssid, const char *password);
+ int storage_get_wifi_credentials(char *ssid_buf, char *password_buf);
+ 
+-#endif // __STORAGE_APP_H__
+\ No newline at end of file
++#endif // __STORAGE_APP_H__
+diff --git a/main.c b/main.c
+index db35d2d..a6ff63a 100644
+--- a/main.c
++++ b/main.c
+@@ -33,6 +33,7 @@
+ int main(void)
+ {
+   // Initialize Silicon Labs device, system, service(s) and protocol stack(s).
++
+   sl_main_second_stage_init();
+ 
+   app_init();
+diff --git a/sensor_data_service/chekr_record.c b/sensor_data_service/chekr_record.c
+index 2c9651d..a5292ad 100644
+--- a/sensor_data_service/chekr_record.c
++++ b/sensor_data_service/chekr_record.c
+@@ -1,24 +1,35 @@
+ // #include <stdio.h>
+-#include "sl_constants.h"
+-#include "cmsis_os2.h"
+-
+-#include "storage_api.h"
+-#include "sl_sleeptimer.h"
+-
+-#include "chekr_record.h"
+-#include "imu_service.h"
+-
+-#include "ble_data_parse.h"
+-#include "ble_app_cat.h"
+-#include "common.h"
+-#include "storage_api.h"
+-#include "app_log.h"
+-
+-static cont_rec_session_details_t cont_rec_session_details;
+-
+-static file_handle_t m_handle;
+-
+-char ses_uid_str[8 * 2 + 1] = {0}; // 2 characters per byte + 1 for null terminator
++#include "sl_constants.h"
++#include "cmsis_os2.h"
++#include "FreeRTOS.h"
++#include "queue.h"
++#include "task.h"
++
++#include "storage_api.h"
++#include "sl_sleeptimer.h"
++
++#include "chekr_record.h"
++#include "imu_service.h"
++
++#include "ble_data_parse.h"
++#include "ble_app_cat.h"
++#include "common.h"
++#include "storage_api.h"
++#include "app_log.h"
++#include "spa06_003.h"
++#include "bmm350.h"
++#include "mlx90632.h"
++#include "sl_status.h"
++#include <stdbool.h>
++#include <inttypes.h>
++#include <math.h>
++#include <string.h>
++
++static cont_rec_session_details_t cont_rec_session_details;
++
++static file_handle_t m_handle;
++
++char ses_uid_str[8 * 2 + 1] = {0}; // 2 characters per byte + 1 for null terminator
+ uint8_t start_ble_live_imu_raw_flag = 0;
+ // 2 charactes for one byte,
+ // 8 x 2 bytes of unique ID of continuous recording, 1 x 2 byte for chunk ID, 1 byte for null terminator
+@@ -29,29 +40,195 @@ static char cont_rec_uid_str[9 * 2 + 1] = {0};
+ uint16_t read_chunk_id = 0;
+ // uint8_t del_con_rec_ses_flag = 0;
+ // uint8_t start_cont_rec_after_flash_erase_flag = 0;
+-static uint8_t start_rec_after_flash_erase_flag = 0;
+-static uint8_t stop_rec_after_flag = 0;
+-
+-// Global variables required for continuous recording
+-uint8_t continuous_recording_flag = 0;	// 0 - No continuous recording, 1 - Continuous recording
+-
+-void sensor_data_record_init()
+-{
+-    for (int i = 0;i < 8;i++)
+-	{
+-		cont_rec_session_details.uid[i] = 0;
+-	}
+-    cont_rec_session_details.status = CONT_REC_RESV;
+-    cont_rec_session_details.rec_type = 0;
+-    cont_rec_session_details.chunk_size = 0;
+-    cont_rec_session_details.chunk_count = 0;
+-}
+-
+-static void record_samples_cb(imu_sample_t data)
+-{
+-	// // put imu data on a work queue and process outside of trigger callback
+-	// struct sample_queue_t *sample_q = malloc(sizeof(struct sample_queue_t));
+-	// if (!sample_q) {
++static uint8_t start_rec_after_flash_erase_flag = 0;
++static uint8_t stop_rec_after_flag = 0;
++
++// Global variables required for continuous recording
++uint8_t continuous_recording_flag = 0;	// 0 - No continuous recording, 1 - Continuous recording
++
++#define RECORD_QUEUE_LENGTH 8U
++
++typedef struct {
++	raw_imu_record_t record;
++	bool has_record;
++} record_queue_item_t;
++
++static QueueHandle_t record_queue = NULL;
++static TaskHandle_t record_writer_task_handle = NULL;
++static volatile bool record_writer_running = false;
++static uint32_t record_queue_dropped = 0;
++static uint32_t record_queue_enqueued = 0;
++static uint32_t records_written_total = 0;
++
++static void record_writer_task(void *argument);
++
++typedef struct {
++	uint64_t timestamp_ms;
++	int32_t pressure_pa_x10;
++	int16_t pressure_temp_cC;
++	int16_t ir_object_temp_cC;
++	int16_t ir_ambient_temp_cC;
++	int16_t mag_uT_x;
++	int16_t mag_uT_y;
++	int16_t mag_uT_z;
++	uint16_t flags;
++} aux_sensor_snapshot_t;
++
++static aux_sensor_snapshot_t aux_snapshot = { 0 };
++
++static inline int16_t float_to_centi_deg(double value)
++{
++	double scaled = value * 100.0;
++	return (int16_t)((scaled >= 0.0) ? (scaled + 0.5) : (scaled - 0.5));
++}
++
++static void aux_snapshot_apply(raw_imu_record_t *record)
++{
++	taskENTER_CRITICAL();
++	aux_sensor_snapshot_t snapshot = aux_snapshot;
++	taskEXIT_CRITICAL();
++
++	record->aux_timestamp_ms = snapshot.timestamp_ms;
++	record->pressure_pa_x10 = snapshot.pressure_pa_x10;
++	record->pressure_temp_cC = snapshot.pressure_temp_cC;
++	record->ir_object_temp_cC = snapshot.ir_object_temp_cC;
++	record->ir_ambient_temp_cC = snapshot.ir_ambient_temp_cC;
++	record->mag_uT_x = snapshot.mag_uT_x;
++	record->mag_uT_y = snapshot.mag_uT_y;
++	record->mag_uT_z = snapshot.mag_uT_z;
++	record->aux_flags = snapshot.flags;
++	record->reserved = 0;
++}
++
++static void aux_snapshot_update_pressure(int32_t pressure_pa_x10, int16_t temperature_cC)
++{
++	uint64_t timestamp_ms = get_unix_timestamp();
++	taskENTER_CRITICAL();
++	aux_snapshot.timestamp_ms = timestamp_ms;
++	aux_snapshot.pressure_pa_x10 = pressure_pa_x10;
++	aux_snapshot.pressure_temp_cC = temperature_cC;
++	aux_snapshot.flags |= RAW_RECORD_AUX_FLAG_PRESSURE | RAW_RECORD_AUX_FLAG_PRESS_TEMP;
++	taskEXIT_CRITICAL();
++}
++
++static void aux_snapshot_clear_pressure(void)
++{
++	taskENTER_CRITICAL();
++	aux_snapshot.flags &= ~(RAW_RECORD_AUX_FLAG_PRESSURE | RAW_RECORD_AUX_FLAG_PRESS_TEMP);
++	taskEXIT_CRITICAL();
++}
++
++static void aux_snapshot_update_magnetometer(int16_t x, int16_t y, int16_t z)
++{
++	uint64_t timestamp_ms = get_unix_timestamp();
++	taskENTER_CRITICAL();
++	aux_snapshot.timestamp_ms = timestamp_ms;
++	aux_snapshot.mag_uT_x = x;
++	aux_snapshot.mag_uT_y = y;
++	aux_snapshot.mag_uT_z = z;
++	aux_snapshot.flags |= RAW_RECORD_AUX_FLAG_MAGNETOMETER;
++	taskEXIT_CRITICAL();
++}
++
++static void aux_snapshot_clear_magnetometer(void)
++{
++	taskENTER_CRITICAL();
++	aux_snapshot.flags &= ~RAW_RECORD_AUX_FLAG_MAGNETOMETER;
++	taskEXIT_CRITICAL();
++}
++
++static void aux_snapshot_update_ir(int16_t ambient_cC, int16_t object_cC)
++{
++	uint64_t timestamp_ms = get_unix_timestamp();
++	taskENTER_CRITICAL();
++	aux_snapshot.timestamp_ms = timestamp_ms;
++	aux_snapshot.ir_ambient_temp_cC = ambient_cC;
++	aux_snapshot.ir_object_temp_cC = object_cC;
++	aux_snapshot.flags |= RAW_RECORD_AUX_FLAG_IR_AMBIENT | RAW_RECORD_AUX_FLAG_IR_OBJECT;
++	taskEXIT_CRITICAL();
++}
++
++static void aux_snapshot_clear_ir(void)
++{
++	taskENTER_CRITICAL();
++	aux_snapshot.flags &= ~(RAW_RECORD_AUX_FLAG_IR_AMBIENT | RAW_RECORD_AUX_FLAG_IR_OBJECT);
++	taskEXIT_CRITICAL();
++}
++
++void sensor_data_record_init()
++{
++    for (int i = 0;i < 8;i++)
++	{
++		cont_rec_session_details.uid[i] = 0;
++	}
++    cont_rec_session_details.status = CONT_REC_RESV;
++    cont_rec_session_details.rec_type = 0;
++    cont_rec_session_details.chunk_size = 0;
++    cont_rec_session_details.chunk_count = 0;
++    memset(&aux_snapshot, 0, sizeof(aux_snapshot));
++}
++
++static void record_writer_task(void *argument)
++{
++	(void)argument;
++	record_queue_item_t item;
++	app_log_info("record_writer_task started\r\n");
++	while (xQueueReceive(record_queue, &item, portMAX_DELAY) == pdTRUE) {
++		if (!item.has_record) {
++			app_log_info("record_writer_task received stop signal after %lu writes\r\n",
++			             (unsigned long)records_written_total);
++			break;
++		}
++		if (m_handle != NULL) {
++			int ret = storage_write_raw_imu_record(m_handle, item.record);
++			if (ret) {
++				app_log_error("failed to write imu sample: ret=%d\r\n", ret);
++			} else {
++				records_written_total++;
++                if (records_written_total <= 3U || (records_written_total % 50U) == 0U) {
++                    UBaseType_t pending = (record_queue != NULL) ? uxQueueMessagesWaiting(record_queue) : 0U;
++                    app_log_info("wrote record #%lu ts=%" PRIu64 " flags=0x%04X written=%lu pending=%u\r\n",
++                                 (unsigned long)item.record.record_num,
++                                 (uint64_t)item.record.base_timestamp_ms,
++                                 (unsigned int)item.record.aux_flags,
++                                 (unsigned long)records_written_total,
++                                 (unsigned int)pending);
++                }
++			}
++		}
++	}
++	// Drain any residual frames that might have arrived before the stop signal.
++	while (uxQueueMessagesWaiting(record_queue) > 0) {
++		if (xQueueReceive(record_queue, &item, 0) != pdTRUE) {
++			break;
++		}
++		if (item.has_record && m_handle != NULL) {
++			int ret = storage_write_raw_imu_record(m_handle, item.record);
++			if (ret) {
++				app_log_error("failed to flush imu sample: ret=%d\r\n", ret);
++			} else {
++				records_written_total++;
++                    if (records_written_total <= 3U || (records_written_total % 50U) == 0U) {
++                        app_log_info("flushed record #%lu ts=%" PRIu64 " flags=0x%04X total=%lu\r\n",
++                                     (unsigned long)item.record.record_num,
++                                     (uint64_t)item.record.base_timestamp_ms,
++                                     (unsigned int)item.record.aux_flags,
++                                     (unsigned long)records_written_total);
++				}
++			}
++		}
++	}
++	record_writer_running = false;
++	record_writer_task_handle = NULL;
++	app_log_info("record_writer_task exiting\r\n");
++	vTaskDelete(NULL);
++}
++
++static void record_samples_cb(imu_sample_t data)
++{
++	// // put imu data on a work queue and process outside of trigger callback
++	// struct sample_queue_t *sample_q = malloc(sizeof(struct sample_queue_t));
++	// if (!sample_q) {
+ 	// 	app_log_error("can't malloc sample_q!");
+ 	// 	return -1;
+ 	// }
+@@ -69,24 +246,41 @@ int chekr_set_filehandle(file_handle_t handle)
+ 	return 0;
+ }
+ 
+-int chekr_record_samples(imu_sample_t data)
+-{
+-	static raw_imu_record_t record;
+-	static uint32_t record_count;
+-	uint8_t index = data.sample_count % RAW_FRAMES_PER_RECORD;
+-
+-	// app_log_info("sample_count: %d, index: %d\r\n", data.sample_count, index);
+-
+-	if (data.sample_count == 0) {
+-		// reset record_count on first sample of recording sessions
+-		record_count = 0;
+-	}
+-
+-	if (index == 0) {
+-		// save timestamp of first sample in record
+-		// record.timestamp = sys_cpu_to_be64(data.timestamp);
+-		record.timestamp = data.timestamp;
+-	}
++int chekr_record_samples(imu_sample_t data)
++{
++	static raw_imu_record_t record;
++	static uint32_t record_count;
++	static uint32_t sample_debug_count = 0;
++	uint8_t index = data.sample_count % RAW_FRAMES_PER_RECORD;
++
++	// app_log_info("sample_count: %d, index: %d\r\n", data.sample_count, index);
++	if (sample_debug_count < 20U) {
++		app_log_debug("IMU sample[%lu] count=%lu idx=%u ts=%" PRIu64 " ax=%d ay=%d az=%d gx=%d gy=%d gz=%d\r\n",
++		              (unsigned long)sample_debug_count,
++		              (unsigned long)data.sample_count,
++		              (unsigned int)index,
++		              (uint64_t)data.timestamp,
++		              (int)data.ax,
++		              (int)data.ay,
++		              (int)data.az,
++		              (int)data.gx,
++		              (int)data.gy,
++		              (int)data.gz);
++		sample_debug_count++;
++	}
++
++	if (data.sample_count == 0) {
++		// reset record_count on first sample of recording sessions
++		record_count = 0;
++		sample_debug_count = 0;
++		memset(&record, 0, sizeof(record));
++	}
++
++	if (index == 0) {
++		// save timestamp of first sample in record
++		record.version = RAW_IMU_RECORD_VERSION;
++		record.base_timestamp_ms = data.timestamp;
++	}
+ 
+ 	record.raw_data[index].ax = data.ax;
+ 	record.raw_data[index].ay = data.ay;
+@@ -95,52 +289,43 @@ int chekr_record_samples(imu_sample_t data)
+ 	record.raw_data[index].gy = data.gy;
+ 	record.raw_data[index].gz = data.gz;
+ 
+-	// write to flash when we fill in last sample in record
+-	if ((index + 1) % (RAW_FRAMES_PER_RECORD) == 0) {
+-		// record.record_num = sys_cpu_to_be32(record_count);
+-		record.record_num = (record_count);
+-		record_count++;
+-
+-		// // BLE live broadcast the record if the flag is set
+-		// // else, write to flash.
+-		// if (1 == start_ble_live_imu_raw_flag)
+-		// {
+-		// 	// Notify the central device with the record data
+-		// 	typedef struct __attribute__((__packed__)) {
+-		// 		uint8_t soh;
+-		// 		raw_imu_record_t record;
+-		// 		uint16_t crc;
+-		// 	} start_ble_live_imu_raw_resp_t1;
+-		
+-		// 	start_ble_live_imu_raw_resp_t1 resp = { .soh = 2 };
+-
+-		// 	memcpy(&resp.record, &record, sizeof(record));
+-		// 	resp.crc = utils_crc16_modbus((const uint8_t *)&resp, sizeof(resp) - sizeof(uint16_t));
+-		// 	notify_tocentral((uint8_t *)&resp, sizeof(resp));
+-
+-		// } else {
+-			app_log_info("writing imu sample: %d\r\n", record.record_num);
+-			int ret = storage_write_raw_imu_record(m_handle, record);
+-			if (ret) {
+-				app_log_error("failed to write imu sample: ret=%d\r\n", ret);
+-				return -1;			
+-			}
+-			/// test
+-			// else {
+-			// 	app_log_hexdump_info(&record, sizeof(raw_imu_record_t));
+-			// 	// unsigned int data_len = sizeof(raw_imu_record_t);
+-			// 	// for (size_t i = 0; i < data_len; i++)
+-			// 	// {
+-			// 	// 	app_log_debug("%02x ", ((uint8_t *)&record)[i]);
+-			// 	// }
+-			// }
+-			/// test
+-		// }
+-	}
+-
+-	// indication we're recording
+-	if (data.sample_count % BLIP_SAMPLE_INTERVAL == 0) {
+-		// pmic_blip_blue_led();
++	// write to flash when we fill in last sample in record
++	if ((index + 1) % (RAW_FRAMES_PER_RECORD) == 0) {
++		app_log_debug("IMU record boundary reached, sample_count=%lu\r\n",
++		              (unsigned long)data.sample_count);
++		// record.record_num = sys_cpu_to_be32(record_count);
++		record.record_num = (record_count);
++		record_count++;
++
++		aux_snapshot_apply(&record);
++
++		if (record_queue != NULL) {
++			record_queue_item_t msg = {
++				.record = record,
++				.has_record = true,
++			};
++			if (xQueueSend(record_queue, &msg, 0) != pdTRUE) {
++				record_queue_dropped++;
++				if (record_queue_dropped == 1 || (record_queue_dropped % 100U) == 0U) {
++					app_log_warning("imu record queue full, dropped=%u\r\n", record_queue_dropped);
++				}
++			} else {
++				record_queue_enqueued++;
++				if (record_queue_enqueued <= 3U || (record_queue_enqueued % 50U) == 0U) {
++					app_log_info("queued record #%lu ts=%" PRIu64 " flags=0x%04X queued=%lu dropped=%lu\r\n",
++					            (unsigned long)record.record_num,
++					            (uint64_t)record.base_timestamp_ms,
++					            (unsigned int)record.aux_flags,
++					            (unsigned long)record_queue_enqueued,
++					            (unsigned long)record_queue_dropped);
++				}
++			}
++		}
++	}
++
++	// indication we're recording
++	if (data.sample_count % BLIP_SAMPLE_INTERVAL == 0) {
++		// pmic_blip_blue_led();
+ 	}
+ 
+ 	return 0;
+@@ -157,51 +342,127 @@ int record_to_file(char *filename, RecordTypeE type)
+ 	int ret;
+ 	file_handle_t handle;
+ 
+-	if (type == RECORD_START) {
+-		handle = storage_open_file(filename);
+-
+-		app_log_debug("handle: %p\r\n", handle);
++	if (type == RECORD_START) {
++		handle = storage_open_file(filename);
++
++		app_log_debug("handle: %p\r\n", handle);
+ 
+ 		if (handle == NULL) {
+ 			app_log_error("failed to open file %s\r\n", filename);
+ 			return -1;
+-		}
+-
+-		// set handle if we opened file successfully
+-		m_handle = handle;
+-
+-		ret = imu_enable(RECORD_SAMPLE_RATE, record_samples_cb);
+-		if (ret) {
+-			app_log_error("failed to enable IMU\r\n");
+-			storage_close_file(m_handle);
+-			return -1;
+-		}
+-
+-		// k_timer_start(&recording_timer, K_SECONDS(RECORDING_MAX_TIME_S), K_NO_WAIT);
++		}
++
++		// set handle if we opened file successfully
++		m_handle = handle;
++
++		if (record_queue != NULL) {
++			vQueueDelete(record_queue);
++			record_queue = NULL;
++		}
++
++		record_queue = xQueueCreate(RECORD_QUEUE_LENGTH, sizeof(record_queue_item_t));
++		if (record_queue == NULL) {
++			app_log_error("failed to create imu record queue\r\n");
++			storage_close_file(m_handle);
++			m_handle = NULL;
++			return -1;
++		}
++
++		record_queue_dropped = 0;
++		record_queue_enqueued = 0;
++		records_written_total = 0;
++
++		taskENTER_CRITICAL();
++		memset(&aux_snapshot, 0, sizeof(aux_snapshot));
++		taskEXIT_CRITICAL();
++
++		if (record_writer_task_handle != NULL) {
++			// Should not happen, but ensure clean slate.
++			app_log_warning("record writer task still running, resetting\r\n");
++			record_writer_running = false;
++			vTaskDelete(record_writer_task_handle);
++			record_writer_task_handle = NULL;
++		}
++
++		record_writer_running = true;
++		BaseType_t task_status = xTaskCreate(
++			record_writer_task,
++			"IMURecWr",
++			configMINIMAL_STACK_SIZE + 512,
++			NULL,
++			tskIDLE_PRIORITY + 2,
++			&record_writer_task_handle);
++		if (task_status != pdPASS) {
++			app_log_error("failed to start record writer task\r\n");
++			record_writer_running = false;
++			vQueueDelete(record_queue);
++			record_queue = NULL;
++			storage_close_file(m_handle);
++			m_handle = NULL;
++			return -1;
++		}
++
++		ret = imu_enable(RECORD_SAMPLE_RATE, record_samples_cb);
++		if (ret) {
++			app_log_error("failed to enable IMU\r\n");
++			record_queue_item_t stop_msg = { .has_record = false };
++			xQueueSend(record_queue, &stop_msg, 0);
++			while (record_writer_running) {
++				vTaskDelay(pdMS_TO_TICKS(5));
++			}
++			if (record_queue != NULL) {
++				vQueueDelete(record_queue);
++				record_queue = NULL;
++			}
++			storage_close_file(m_handle);
++			return -1;
++		}
++
++		// k_timer_start(&recording_timer, K_SECONDS(RECORDING_MAX_TIME_S), K_NO_WAIT);
+ 
+ 		app_log_info("started IMU and writing IMU samples to file:%s\r\n", filename);
+-	} else {	// stop
+-		app_log_info("stopping IMU...\r\n");
+-
+-		// k_timer_stop(&recording_timer);
+-
+-		imu_enable(IMU_ODR_0_HZ, NULL); // stop IMU
+-
+-		app_log_info("stopped IMU\r\n");
+-
+-		ret = storage_close_file(m_handle);
+-		if (ret) {
+-			app_log_error("failed to close file %s\r\n", filename);
+-			return -1;
++	} else {	// stop
++		app_log_info("stopping IMU...\r\n");
++
++		// k_timer_stop(&recording_timer);
++
++		imu_enable(IMU_ODR_0_HZ, NULL); // stop IMU
++
++		if (record_queue != NULL) {
++			while (uxQueueMessagesWaiting(record_queue) > 0U) {
++				vTaskDelay(pdMS_TO_TICKS(5));
++			}
++
++			record_queue_item_t stop_msg = { .has_record = false };
++			xQueueSend(record_queue, &stop_msg, portMAX_DELAY);
++
++			while (record_writer_running) {
++				vTaskDelay(pdMS_TO_TICKS(5));
++			}
++
++			vQueueDelete(record_queue);
++			record_queue = NULL;
++		}
++
++		app_log_info("stopped IMU\r\n");
++
++		ret = storage_close_file(m_handle);
++		if (ret) {
++			app_log_error("failed to close file %s\r\n", filename);
++			return -1;
+ 		}
+-
+-		// pmic_blue_led_off();
+-
+-		m_handle = NULL;
+-	}
+-
+-	return 0;
+-}
++
++		// pmic_blue_led_off();
++
++		m_handle = NULL;
++
++		if (record_queue_dropped > 0U) {
++			app_log_warning("imu samples dropped while queue full: %u\r\n", record_queue_dropped);
++		}
++	}
++
++	return 0;
++}
+ 
+ 
+ /***********************************************/
+@@ -368,20 +629,20 @@ int read_rec_session_data_raw_imu(char *data, int len)
+ 	}
+ 
+ 	app_log_debug("(0x12)reading record [%d] from file: %s\r\n", record_num, (char *)uid_str);
+-	activity_record_t record = {0};
+-	int ret = storage_read_activity_record((char *)uid_str, record_num, &record);
++	raw_imu_record_t record = {0};
++	int ret = storage_read_raw_imu_record((char *)uid_str, record_num, &record);
+ 	if (ret < 0) {
+ 		app_log_error("failed to read record %d from file: %s\r\n", record_num, (char *)uid_str);
+ 		return -1;
+ 	}
+ 
+ 	// send response
+-	typedef struct __attribute__((__packed__)) {
+-		// NOTE: unusual header, only a SOH byte
+-		uint8_t soh;
+-		activity_record_t record;
+-		uint16_t crc;
+-	} read_rec_session_data_resp_t;
++	typedef struct __attribute__((__packed__)) {
++		// NOTE: unusual header, only a SOH byte
++		uint8_t soh;
++		raw_imu_record_t record;
++		uint16_t crc;
++	} read_rec_session_data_resp_t;
+ 
+ 	read_rec_session_data_resp_t resp = {
+ 		.soh = 2,
+@@ -1221,28 +1482,72 @@ void sensor_data_thread_create(void)
+  );
+ }
+ 
+-void sensordatareadTask(void *argument)
+-{
+-  UNUSED_PARAMETER(argument);
+-  while (1)
+-  {
+-    osDelay(50);
+-	if (stop_rec_after_flag)
+-	{
+-		record_to_file(ses_uid_str, RECORD_STOP);
+-		stop_rec_after_flag = 0;
+-	}
++void sensordatareadTask(void *argument)
++{
++  UNUSED_PARAMETER(argument);
++  const TickType_t pressure_interval = pdMS_TO_TICKS(100);
++  const TickType_t magnet_interval = pdMS_TO_TICKS(100);
++  const TickType_t ir_interval = pdMS_TO_TICKS(1000);
++  TickType_t last_pressure_tick = xTaskGetTickCount();
++  TickType_t last_magnet_tick = last_pressure_tick;
++  TickType_t last_ir_tick = last_pressure_tick;
++
++  while (1)
++  {
++    TickType_t now = xTaskGetTickCount();
++
++    if ((now - last_pressure_tick) >= pressure_interval) {
++      last_pressure_tick = now;
++      int32_t pressure_raw = spa06_get_pressure(); // 0.1 Pa units
++      int16_t temp_decic = spa06_get_temperature(); // 0.1 °C units
++      if (pressure_raw != 0) {
++        int16_t temp_cC = (int16_t)(temp_decic * 10);
++        aux_snapshot_update_pressure(pressure_raw, temp_cC);
++      } else {
++        aux_snapshot_clear_pressure();
++      }
++    }
++
++    if ((now - last_magnet_tick) >= magnet_interval) {
++      last_magnet_tick = now;
++      int16_t mx = 0, my = 0, mz = 0;
++      if (bmm350_read_field(&mx, &my, &mz)) {
++        aux_snapshot_update_magnetometer(mx, my, mz);
++      } else {
++        aux_snapshot_clear_magnetometer();
++      }
++    }
++
++    if ((now - last_ir_tick) >= ir_interval) {
++      last_ir_tick = now;
++      double ambient = 0.0, object = 0.0;
++      if (mlx90632_measurment_cb(&ambient, &object) == SL_STATUS_OK) {
++        int16_t ambient_cC = float_to_centi_deg(ambient);
++        int16_t object_cC = float_to_centi_deg(object);
++        aux_snapshot_update_ir(ambient_cC, object_cC);
++      } else {
++        aux_snapshot_clear_ir();
++      }
++    }
++
++    if (stop_rec_after_flag)
++	{
++		record_to_file(ses_uid_str, RECORD_STOP);
++		stop_rec_after_flag = 0;
++	}
+ 	else if (1 == start_rec_after_flash_erase_flag)
+-	{
+-		// Start the recording after flash erase.
+-		start_rec_after_flash_erase();
+-		start_rec_after_flash_erase_flag = 0;
+-	}
+-
+-    // lsm6dsv_test();
+-    // 打印时间戳测试
+-    // app_log_info("current time: %s\r\n", get_unix_timestamp_string());
+-    // bmm350_test();
++	{
++		// Start the recording after flash erase.
++		start_rec_after_flash_erase();
++		start_rec_after_flash_erase_flag = 0;
++	}
++
++    vTaskDelay(pdMS_TO_TICKS(50));
++
++    // lsm6dsv_test();
++    // 打印时间戳测试
++    // app_log_info("current time: %s\r\n", get_unix_timestamp_string());
++    // bmm350_test();
+     // spa06_test();
+     // mlx90632_test();
+   }
+@@ -1427,4 +1732,4 @@ void test_file_close()
+         app_log_debug("File closed successfully\r\n");
+     }
+ }
+-*/
+\ No newline at end of file
++*/
+diff --git a/sensor_data_service/chekr_record.h b/sensor_data_service/chekr_record.h
+index 120dfec..e621306 100644
+--- a/sensor_data_service/chekr_record.h
++++ b/sensor_data_service/chekr_record.h
+@@ -4,7 +4,7 @@
+ #include "stdint.h"
+ #include "imu_service.h"
+ 
+-#define RECORD_SAMPLE_RATE (IMU_ODR_15_HZ)
++#define RECORD_SAMPLE_RATE (IMU_ODR_60_HZ)
+ 
+ typedef enum {
+ 	RECORD_STOP = 0,
+@@ -67,4 +67,4 @@ void start_cont_rec_after_flash_erase();
+ void sensor_data_thread_create(void);	//check record thread
+ // void start_rec_after_flash_erase();
+ 
+-#endif // _CHEKR_RECORD_H
+\ No newline at end of file
++#endif // _CHEKR_RECORD_H
+diff --git a/sensor_data_service/imu_service.c b/sensor_data_service/imu_service.c
+index a99abed..26777c1 100644
+--- a/sensor_data_service/imu_service.c
++++ b/sensor_data_service/imu_service.c
+@@ -8,6 +8,7 @@
+ 
+ #include "common.h"
+ #include <inttypes.h> // For PRId64
++#include <stdbool.h>
+ 
+ static imu_output_cb_t callback; // callback for sampled data
+ static int trig_cnt;
+@@ -18,6 +19,13 @@ static int imu_sampling(void);
+ TaskHandle_t imu_task_handle = NULL;
+ volatile bool imu_task_running = false;
+ uint32_t imu_sample_period_ms = 0;
++static uint32_t imu_sample_period_remainder = 0;
++static uint32_t imu_delay_remainder_acc = 0;
++static uint32_t imu_timestamp_remainder_acc = 0;
++static uint64_t imu_timestamp_ms = 0;
++static bool imu_timestamp_seeded = false;
++static output_data_rate_t imu_active_rate = IMU_ODR_0_HZ;
++static uint32_t imu_debug_log_count = 0;
+ 
+ static int imu_sampling(void)
+ {
+@@ -25,7 +33,22 @@ static int imu_sampling(void)
+ 
+ 	int16_t accelerometer[3]; // 单位：mg
+   	int32_t gyroscope[3];     // 单位：mdps
+-	sample.timestamp =  get_unix_timestamp();
++	if (!imu_timestamp_seeded) {
++		imu_timestamp_ms = get_unix_timestamp();
++		imu_timestamp_remainder_acc = 0;
++		imu_timestamp_seeded = true;
++	} else {
++		imu_timestamp_ms += imu_sample_period_ms;
++		if (imu_active_rate > 0) {
++			imu_timestamp_remainder_acc += imu_sample_period_remainder;
++			while (imu_timestamp_remainder_acc >= (uint32_t)imu_active_rate) {
++				imu_timestamp_ms += 1;
++				imu_timestamp_remainder_acc -= (uint32_t)imu_active_rate;
++			}
++		}
++	}
++
++	sample.timestamp =  imu_timestamp_ms;
+ 	sample.sample_count = trig_cnt;
+ 
+     lsm6dsv_readdata(accelerometer, gyroscope);
+@@ -36,6 +59,19 @@ static int imu_sampling(void)
+     sample.gy = gyroscope[1];
+     sample.gz = gyroscope[2];
+ 
++	if (imu_debug_log_count < 20U) {
++		app_log_debug("imu_sampling[%lu] ts=%" PRIu64 " ax=%d ay=%d az=%d gx=%d gy=%d gz=%d\r\n",
++		              (unsigned long)imu_debug_log_count,
++		              (uint64_t)sample.timestamp,
++		              (int)sample.ax,
++		              (int)sample.ay,
++		              (int)sample.az,
++		              (int)sample.gx,
++		              (int)sample.gy,
++		              (int)sample.gz);
++		imu_debug_log_count++;
++	}
++
+ 	if (callback != NULL) {
+ 		callback(sample);
+ 	}
+@@ -62,8 +98,20 @@ static void imu_sampling_task(void *argument)
+     
+     while (imu_task_running) {
+         imu_sampling();
+-        
+-        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(imu_sample_period_ms));
++
++        uint32_t delay_ms = imu_sample_period_ms;
++        if (imu_active_rate > 0) {
++        	imu_delay_remainder_acc += imu_sample_period_remainder;
++        	while (imu_delay_remainder_acc >= (uint32_t)imu_active_rate) {
++        		delay_ms += 1;
++        		imu_delay_remainder_acc -= (uint32_t)imu_active_rate;
++        	}
++        }
++        if (delay_ms == 0) {
++        	delay_ms = 1;
++        }
++
++        vTaskDelayUntil(&xLastWakeTime, pdMS_TO_TICKS(delay_ms));
+     }
+     
+     // 任务退出前清理
+@@ -81,12 +129,13 @@ int imu_enable(output_data_rate_t rate, imu_output_cb_t cb)
+ 	if (rate == IMU_ODR_0_HZ) {
+ 		if (imu_task_handle != NULL){
+ 			imu_task_running = false;
++			imu_active_rate = IMU_ODR_0_HZ;
+ 
+ 			// 等待任务安全退出（最多等待2个采样周期）
+ 			uint32_t wait_time = imu_sample_period_ms * 2;
+ 			if (wait_time < 10) wait_time = 10;
+ 			
+-			osDelay(pdMS_TO_TICKS(wait_time));
++			vTaskDelay(pdMS_TO_TICKS(wait_time));
+ 			
+ 			// 如果任务还未退出，强制删除
+ 			if (imu_task_handle != NULL) {
+@@ -100,12 +149,18 @@ int imu_enable(output_data_rate_t rate, imu_output_cb_t cb)
+ 		// 如果任务已在运行，先停止
+ 		if (imu_task_handle != NULL) {
+ 			imu_task_running = false;
+-			osDelay(pdMS_TO_TICKS(10));
++			vTaskDelay(pdMS_TO_TICKS(10));
+ 		}
+ 		
+ 		callback = cb;
+ 		imu_sample_period_ms = 1000 / rate;
++		imu_sample_period_remainder = 1000 % rate;
++		imu_delay_remainder_acc = 0;
++		imu_timestamp_remainder_acc = 0;
++		imu_timestamp_seeded = false;
++		imu_active_rate = rate;
+ 		trig_cnt = 0; // clear count when enabling with a non-zero rate
++		imu_debug_log_count = 0;
+ 	
+ 		imu_task_running = true;
+ 		BaseType_t status = xTaskCreate(
+@@ -131,4 +186,3 @@ int imu_get_trigger_count(void)
+ {
+ 	return trig_cnt;
+ }
+-
+diff --git a/sensor_driver/bmm350.c b/sensor_driver/bmm350.c
+index 989e88f..62202e1 100644
+--- a/sensor_driver/bmm350.c
++++ b/sensor_driver/bmm350.c
+@@ -38,6 +38,7 @@
+ 
+ /*************************** Header files *******************************/
+ #include "bmm350.h"
++#include <math.h>
+ 
+ #ifdef __KERNEL__
+ #include <linux/types.h>
+@@ -1883,7 +1884,7 @@ void bmm350_init()
+     }
+ 
+     /* Set ODR and performance */
+-    rslt = bmm350_set_odr_performance(BMM350_DATA_RATE_25HZ, BMM350_AVERAGING_8, &dev);
++    rslt = bmm350_set_odr_performance(BMM350_DATA_RATE_12_5HZ, BMM350_AVERAGING_8, &dev);
+ 
+     /* Enable all axis */
+     rslt = bmm350_enable_axes(BMM350_X_EN, BMM350_Y_EN, BMM350_Z_EN, &dev);
+@@ -1900,6 +1901,31 @@ void bmm350_init()
+     app_log_info("Read : 0x2E : Interrupt control : 0x%X\r\n", int_ctrl);
+ }
+ 
++bool bmm350_read_field(int16_t *x_centi_uT, int16_t *y_centi_uT, int16_t *z_centi_uT)
++{
++    struct bmm350_mag_temp_data mag_temp_data;
++
++    if (bmm350_set_powermode(BMM350_NORMAL_MODE, &dev) != BMM350_OK) {
++        return false;
++    }
++
++    if (bmm350_get_compensated_mag_xyz_temp_data(&mag_temp_data, &dev) != BMM350_OK) {
++        return false;
++    }
++
++    if (x_centi_uT != NULL) {
++        *x_centi_uT = (int16_t)lroundf(mag_temp_data.x * 100.0f);
++    }
++    if (y_centi_uT != NULL) {
++        *y_centi_uT = (int16_t)lroundf(mag_temp_data.y * 100.0f);
++    }
++    if (z_centi_uT != NULL) {
++        *z_centi_uT = (int16_t)lroundf(mag_temp_data.z * 100.0f);
++    }
++
++    return true;
++}
++
+ void bmm350_test(void)
+ {
+     struct bmm350_mag_temp_data mag_temp_data;
+@@ -1919,4 +1945,3 @@ void bmm350_test(void)
+     app_log_info("magnetic [uT]:%d\t%d\t%d\r\n", magnetic_ut[0], magnetic_ut[1], magnetic_ut[2]);
+     app_log_info("temperature [degC]:%d\r\n", temperature);
+ }
+-
+diff --git a/sensor_driver/bmm350.h b/sensor_driver/bmm350.h
+index ed769e0..65971d8 100644
+--- a/sensor_driver/bmm350.h
++++ b/sensor_driver/bmm350.h
+@@ -52,6 +52,8 @@ extern "C" {
+ /*************************** Header files *******************************/
+ 
+ #include  "bmm350_reg.h"
++#include <stdbool.h>
++#include <stdint.h>
+ 
+ /******************* Function prototype declarations ********************/
+ 
+@@ -594,5 +596,6 @@ int8_t bmm350_get_pmu_cmd_status_0(struct bmm350_pmu_cmd_status_0 *pmu_cmd_stat_
+ 
+ void bmm350_init();
+ void bmm350_test();
++bool bmm350_read_field(int16_t *x_centi_uT, int16_t *y_centi_uT, int16_t *z_centi_uT);
+ 
+ #endif /* _BMM350_H */
+diff --git a/sensor_driver/common_i2c.c b/sensor_driver/common_i2c.c
+index b10e56b..b009d38 100644
+--- a/sensor_driver/common_i2c.c
++++ b/sensor_driver/common_i2c.c
+@@ -1,3 +1,5 @@
++#include <stdbool.h>
++
+ #include "common_i2c.h"
+ // #include "cmsis_os2.h"
+ #include "sl_utility.h"
+@@ -7,6 +9,52 @@
+ #include "sl_si91x_i2c.h"
+ #include "sl_si91x_peripheral_i2c.h"
+ #include "app_log.h"
++#include "FreeRTOS.h"
++#include "semphr.h"
++#include "task.h"
++
++#define I2C_INSTANCE_COUNT 3
++
++static StaticSemaphore_t i2c_mutex_buffer[I2C_INSTANCE_COUNT];
++static SemaphoreHandle_t i2c_mutex[I2C_INSTANCE_COUNT];
++
++static inline bool scheduler_has_started(void)
++{
++#if (INCLUDE_xTaskGetSchedulerState == 1)
++  return xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED;
++#else
++  return true;
++#endif
++}
++
++static bool i2c_try_lock(sl_i2c_instance_t i2c_instance)
++{
++  if (i2c_instance != INSTANCE_ONE) {
++    return false;
++  }
++
++  if ((i2c_mutex[INSTANCE_ONE] == NULL) || !scheduler_has_started()) {
++    return false;
++  }
++
++  if (xSemaphoreTake(i2c_mutex[INSTANCE_ONE], portMAX_DELAY) == pdPASS) {
++    return true;
++  }
++
++  app_log_error("[i2c%d] failed to lock mutex\r\n", i2c_instance);
++  return false;
++}
++
++static void i2c_unlock(sl_i2c_instance_t i2c_instance, bool locked)
++{
++  if (!locked || (i2c_instance != INSTANCE_ONE)) {
++    return;
++  }
++
++  if (xSemaphoreGive(i2c_mutex[INSTANCE_ONE]) != pdPASS) {
++    app_log_error("[i2c%d] failed to unlock mutex\r\n", i2c_instance);
++  }
++}
+ 
+ static void platform_sl_i2c_init(int i2c_instance)
+ {
+@@ -39,6 +87,11 @@ static void platform_sl_i2c_init(int i2c_instance)
+ 
+ void platform_i2c_init()
+ {
++  if (i2c_mutex[INSTANCE_ONE] == NULL) {
++    i2c_mutex[INSTANCE_ONE] = xSemaphoreCreateMutexStatic(&i2c_mutex_buffer[INSTANCE_ONE]);
++    configASSERT(i2c_mutex[INSTANCE_ONE] != NULL);
++  }
++
+   platform_sl_i2c_init(INSTANCE_ZERO);
+   platform_sl_i2c_init(INSTANCE_ONE);
+   platform_sl_i2c_init(INSTANCE_TWO);
+@@ -49,6 +102,7 @@ int32_t platform_write(sl_i2c_instance_t i2c_instance, int slave_addr, void *han
+   UNUSED_PARAMETER(handle);
+   uint8_t write_buf[len + 1];
+   sl_i2c_status_t i2c_status;
++  bool locked = i2c_try_lock(i2c_instance);
+ 
+   write_buf[0] = regadr;
+   memcpy(&write_buf[1], buf, len);
+@@ -62,9 +116,11 @@ int32_t platform_write(sl_i2c_instance_t i2c_instance, int slave_addr, void *han
+   
+   i2c_status = sl_i2c_driver_send_data_blocking(i2c_instance, slave_addr, write_buf, len + 1);
+   if (i2c_status != SL_I2C_SUCCESS) {
++    i2c_unlock(i2c_instance, locked);
+     app_log_error("sl_i2c_driver_send_data_blocking : Invalid Parameters, Error Code : %u \r\n", i2c_status);
+     return SL_I2C_BUS_ERROR;
+   }
++  i2c_unlock(i2c_instance, locked);
+   return SL_I2C_SUCCESS;
+ }
+ int32_t platform_read(sl_i2c_instance_t i2c_instance, int slave_addr, void *handle, uint8_t regadr, uint8_t *buf, uint16_t len)
+@@ -73,6 +129,7 @@ int32_t platform_read(sl_i2c_instance_t i2c_instance, int slave_addr, void *hand
+   sl_i2c_status_t i2c_status;
+   sl_i2c_transfer_config_t transfer;
+   uint8_t write_buf[1] = {regadr};
++  bool locked = i2c_try_lock(i2c_instance);
+   
+   // 写阶段配置
+   transfer.tx_buffer = write_buf;
+@@ -93,9 +150,11 @@ int32_t platform_read(sl_i2c_instance_t i2c_instance, int slave_addr, void *hand
+   // printf("\r\n");
+   
+   if (i2c_status != SL_I2C_SUCCESS) {
++    i2c_unlock(i2c_instance, locked);
+     app_log_error("sl_i2c_driver_receive_data_blocking : Invalid Parameters, Error Code : %u \r\n", i2c_status);
+     return SL_I2C_BUS_ERROR;
+   }
++  i2c_unlock(i2c_instance, locked);
+   return SL_I2C_SUCCESS;
+ }
+ 
+@@ -103,6 +162,7 @@ int32_t platform_write16(sl_i2c_instance_t i2c_instance, int slave_addr, void *h
+ {
+     UNUSED_PARAMETER(handle);
+     sl_i2c_status_t i2c_status;
++    bool locked = i2c_try_lock(i2c_instance);
+ 
+     // uint8_t i2c_write_data[2] = {0};  // 增加2字节地址空间
+     // uint8_t i2c_value_data[2] = {0};
+@@ -133,6 +193,7 @@ int32_t platform_write16(sl_i2c_instance_t i2c_instance, int slave_addr, void *h
+ 
+     i2c_status = sl_i2c_driver_send_data_blocking(i2c_instance, slave_addr, i2c_write_data, len);
+     if (i2c_status != SL_I2C_SUCCESS) {
++        i2c_unlock(i2c_instance, locked);
+         app_log_error("sl_i2c_driver_send_data_blocking failed with %d", i2c_status);
+         return SL_I2C_BUS_ERROR;
+     }
+@@ -141,6 +202,7 @@ int32_t platform_write16(sl_i2c_instance_t i2c_instance, int slave_addr, void *h
+ 
+     value = (uint16_t)(i2c_write_data[2] << 8) | i2c_write_data[3];
+ 
++    i2c_unlock(i2c_instance, locked);
+     return SL_I2C_SUCCESS;
+ }
+ int32_t platform_read16(sl_i2c_instance_t i2c_instance, int slave_addr, void *handle, uint16_t regadr, uint16_t *value, uint16_t len)
+@@ -149,6 +211,7 @@ int32_t platform_read16(sl_i2c_instance_t i2c_instance, int slave_addr, void *ha
+     sl_i2c_status_t i2c_status;
+     uint8_t i2c_write_data[2] = {0};
+     uint8_t i2c_read_data[2] = {0};
++    bool locked = i2c_try_lock(i2c_instance);
+     
+     // sl_i2c_transfer_config_t transfer;
+     i2c_write_data[0] = (uint8_t)(regadr >> 8);
+@@ -169,6 +232,7 @@ int32_t platform_read16(sl_i2c_instance_t i2c_instance, int slave_addr, void *ha
+ 
+     i2c_status = sl_i2c_driver_send_data_blocking(i2c_instance, slave_addr, i2c_write_data, 2);
+     if (i2c_status != SL_I2C_SUCCESS) {
++        i2c_unlock(i2c_instance, locked);
+         return SL_I2C_BUS_ERROR;
+     }
+     
+@@ -177,6 +241,7 @@ int32_t platform_read16(sl_i2c_instance_t i2c_instance, int slave_addr, void *ha
+ 
+     i2c_status = sl_i2c_driver_receive_data_blocking(i2c_instance, slave_addr, i2c_read_data, len);
+     if (i2c_status != SL_I2C_SUCCESS) {
++        i2c_unlock(i2c_instance, locked);
+         return SL_I2C_BUS_ERROR;
+     }
+ 
+@@ -186,6 +251,7 @@ int32_t platform_read16(sl_i2c_instance_t i2c_instance, int slave_addr, void *ha
+     *value = (uint16_t)(i2c_read_data[0] << 8) | i2c_read_data[1];
+     
+ 
++    i2c_unlock(i2c_instance, locked);
+     return SL_I2C_SUCCESS;
+ }
+ 
+@@ -194,6 +260,8 @@ int32_t platform_read32(sl_i2c_instance_t i2c_instance, int slave_addr, void *ha
+     UNUSED_PARAMETER(handle);
+     sl_i2c_status_t i2c_status;
+ 
++    bool locked = i2c_try_lock(i2c_instance);
++
+     uint8_t i2c_write_data[2] = {0};
+     uint8_t i2c_read_data[4] = {0};
+ 
+@@ -205,6 +273,7 @@ int32_t platform_read32(sl_i2c_instance_t i2c_instance, int slave_addr, void *ha
+     
+     i2c_status = sl_i2c_driver_send_data_blocking(i2c_instance, slave_addr, i2c_write_data, 2);
+     if (i2c_status != SL_I2C_SUCCESS) {
++      i2c_unlock(i2c_instance, locked);
+       return SL_I2C_BUS_ERROR;
+     }
+     
+@@ -213,12 +282,14 @@ int32_t platform_read32(sl_i2c_instance_t i2c_instance, int slave_addr, void *ha
+     
+     i2c_status = sl_i2c_driver_receive_data_blocking(i2c_instance, slave_addr, i2c_read_data, len);
+     if (i2c_status != SL_I2C_SUCCESS) {
++      i2c_unlock(i2c_instance, locked);
+       return SL_I2C_BUS_ERROR;
+     }
+     // app_log_debug("Received: [0x%02X][0x%02X][0x%02X][0x%02X]", i2c_read_data[0], i2c_read_data[1], i2c_read_data[2], i2c_read_data[3]);
+     
+     *value = (i2c_read_data[0] << 8) | i2c_read_data[1] | (i2c_read_data[2] << 24) | (i2c_read_data[3] << 16);
+     
++    i2c_unlock(i2c_instance, locked);
+     return SL_I2C_SUCCESS;
+ }
+ 
+diff --git a/sensor_driver/lsm6dsv.c b/sensor_driver/lsm6dsv.c
+index 2f75b43..2c71272 100644
+--- a/sensor_driver/lsm6dsv.c
++++ b/sensor_driver/lsm6dsv.c
+@@ -217,8 +217,8 @@ void lsm6dsv_init(void)
+     * Selected data rate have to be equal or greater with respect
+     * with MLC data rate.
+     */
+-    lsm6dsv_xl_data_rate_set(&dev_ctx, LSM6DSV_ODR_AT_15Hz);
+-    lsm6dsv_gy_data_rate_set(&dev_ctx, LSM6DSV_ODR_AT_15Hz);
++    lsm6dsv_xl_data_rate_set(&dev_ctx, LSM6DSV_ODR_AT_60Hz);
++    lsm6dsv_gy_data_rate_set(&dev_ctx, LSM6DSV_ODR_AT_60Hz);
+     /* Set full scale */
+     lsm6dsv_xl_full_scale_set(&dev_ctx, LSM6DSV_XL_SCALE);
+     lsm6dsv_gy_full_scale_set(&dev_ctx, LSM6DSV_GY_SCALE);
+diff --git a/spiflash/spi_flash.c b/spiflash/spi_flash.c
+index 1bdf897..5bc05b6 100644
+--- a/spiflash/spi_flash.c
++++ b/spiflash/spi_flash.c
+@@ -12,7 +12,7 @@
+ 
+ sl_gspi_handle_t gspi_driver_handle = NULL;
+ 
+-#define GSPI_BITRATE                 20000000  // Bitrate for setting the clock division factor
++#define GSPI_BITRATE                 40000000  // Bitrate for setting the clock division factor
+ #define GSPI_BIT_WIDTH               8         // Default Bit width
+ #define GSPI_SWAP_READ_DATA          1         // true to enable and false to disable swap read
+ #define GSPI_SWAP_WRITE_DATA         0         // true to enable and false to disable swap write
+@@ -366,4 +366,3 @@ void spi_flash_test(void)
+     // app_log_debug("Test Result: %s\n", errors == 0 ? "PASSED" : "FAILED");
+     // app_log_debug("==============================\n");
+ }
+-
+diff --git a/tools/python/__pycache__/get_mac_address.cpython-313.pyc b/tools/python/__pycache__/get_mac_address.cpython-313.pyc
+deleted file mode 100644
+index 13e3e58..0000000
+Binary files a/tools/python/__pycache__/get_mac_address.cpython-313.pyc and /dev/null differ
+diff --git a/tools/python/__pycache__/start_stop_rec_ses.cpython-313.pyc b/tools/python/__pycache__/start_stop_rec_ses.cpython-313.pyc
+deleted file mode 100644
+index c7ed5a5..0000000
+Binary files a/tools/python/__pycache__/start_stop_rec_ses.cpython-313.pyc and /dev/null differ
+diff --git a/tools/python/convert_records_to_csv.py b/tools/python/convert_records_to_csv.py
+index 9fa4956..f27e46c 100644
+--- a/tools/python/convert_records_to_csv.py
++++ b/tools/python/convert_records_to_csv.py
+@@ -1,17 +1,21 @@
+ 
+-"""Convert base64-encoded IMU records into a CSV file."""
++"""Convert captured IMU records into per-sensor CSV files."""
+ 
+-import argparse
+-import base64
+-import csv
+-from pathlib import Path
+-from typing import Iterable, Tuple
++import argparse
++import base64
++import csv
++import itertools
++from contextlib import ExitStack
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Dict, Iterator, Tuple
+ 
+ SOH = 0x02
+-RECORD_FRAME_LENGTH = 195
+-RECORD_DATA_LENGTH = 192
+-CRC_LENGTH = 2
+-RAW_FRAMES_PER_RECORD = 10
++RECORD_FRAME_LENGTH = 227
++RECORD_DATA_LENGTH = 224
++CRC_LENGTH = 2
++RAW_FRAMES_PER_RECORD = 10
++SUPPORTED_VERSIONS = {2}
+ 
+ 
+ def crc16_modbus(data: bytes) -> int:
+@@ -27,82 +31,355 @@ def crc16_modbus(data: bytes) -> int:
+     return crc & 0xFFFF
+ 
+ 
+-def parse_record(record_bytes: bytes) -> Tuple[int, int, Tuple[Tuple[int, ...], ...]]:
+-    """Parse a single 195-byte frame and return record data."""
++def parse_record(record_bytes: bytes) -> Tuple[int, int, int, Tuple[Tuple[int, ...], ...], Dict[str, int]]:
++    """Parse a single data frame and return record data."""
+     if len(record_bytes) != RECORD_FRAME_LENGTH:
+         raise ValueError(f"Expected {RECORD_FRAME_LENGTH} bytes, got {len(record_bytes)}")
+ 
+     if record_bytes[0] != SOH:
+         raise ValueError(f"Unexpected start byte: 0x{record_bytes[0]:02X}")
+ 
+-    payload = record_bytes[1 : 1 + RECORD_DATA_LENGTH]
+-    received_crc = int.from_bytes(record_bytes[-CRC_LENGTH:], byteorder="big")
+-    calculated_crc = crc16_modbus(record_bytes[:-CRC_LENGTH])
+-    if received_crc != calculated_crc:
+-        raise ValueError(
+-            f"CRC mismatch: received 0x{received_crc:04X}, expected 0x{calculated_crc:04X}"
+-        )
+-
+-    record_num = int.from_bytes(payload[0:4], byteorder="little", signed=False)
+-    timestamp = int.from_bytes(payload[4:12], byteorder="little", signed=False)
+-
+-    samples_bytes = payload[12:]
+-    frames = []
+-    offset = 0
+-    for _ in range(RAW_FRAMES_PER_RECORD):
+-        ax = int.from_bytes(samples_bytes[offset : offset + 2], byteorder="little", signed=True)
+-        ay = int.from_bytes(samples_bytes[offset + 2 : offset + 4], byteorder="little", signed=True)
+-        az = int.from_bytes(samples_bytes[offset + 4 : offset + 6], byteorder="little", signed=True)
+-        gx = int.from_bytes(samples_bytes[offset + 6 : offset + 10], byteorder="little", signed=True)
++    payload = record_bytes[1 : 1 + RECORD_DATA_LENGTH]
++    received_crc = int.from_bytes(record_bytes[-CRC_LENGTH:], byteorder="big")
++    calculated_crc = crc16_modbus(record_bytes[:-CRC_LENGTH])
++    if received_crc != calculated_crc:
++        raise ValueError(
++            f"CRC mismatch: received 0x{received_crc:04X}, expected 0x{calculated_crc:04X}"
++        )
++
++    version = int.from_bytes(payload[0:4], byteorder="little", signed=False)
++    if version not in SUPPORTED_VERSIONS:
++        raise ValueError(f"Unsupported record version {version}")
++
++    record_num = int.from_bytes(payload[4:8], byteorder="little", signed=False)
++    timestamp = int.from_bytes(payload[8:16], byteorder="little", signed=False)
++
++    samples_bytes = payload[16:16 + RAW_FRAMES_PER_RECORD * 18]
++    offset = 0
++    frames = []
++    for _ in range(RAW_FRAMES_PER_RECORD):
++        ax = int.from_bytes(samples_bytes[offset : offset + 2], byteorder="little", signed=True)
++        ay = int.from_bytes(samples_bytes[offset + 2 : offset + 4], byteorder="little", signed=True)
++        az = int.from_bytes(samples_bytes[offset + 4 : offset + 6], byteorder="little", signed=True)
++        gx = int.from_bytes(samples_bytes[offset + 6 : offset + 10], byteorder="little", signed=True)
+         gy = int.from_bytes(samples_bytes[offset + 10 : offset + 14], byteorder="little", signed=True)
+         gz = int.from_bytes(samples_bytes[offset + 14 : offset + 18], byteorder="little", signed=True)
+         frames.append((ax, ay, az, gx, gy, gz))
+         offset += 18
+ 
+-    return record_num, timestamp, tuple(frames)
+-
+-
+-def iter_records(path: Path) -> Iterable[Tuple[int, int, Tuple[Tuple[int, ...], ...]]]:
+-    with path.open("r", encoding="utf-8") as infile:
+-        for line_number, line in enumerate(infile, start=1):
+-            stripped = line.strip()
+-            if not stripped:
+-                continue
+-            try:
+-                frame = base64.b64decode(stripped)
+-            except base64.binascii.Error as exc:  # noqa: B904
+-                raise ValueError(f"Line {line_number}: invalid base64 data") from exc
+-            try:
+-                yield parse_record(frame)
+-            except ValueError as exc:
+-                raise ValueError(f"Line {line_number}: {exc}") from exc
+-
+-
+-def convert_to_csv(input_path: Path, output_path: Path) -> None:
+-    with output_path.open("w", encoding="utf-8", newline="") as csvfile:
+-        writer = csv.writer(csvfile)
+-        writer.writerow(["record_number", "timestamp", "ax", "ay", "az", "gx", "gy", "gz"])
+-        for record_number, timestamp, frames in iter_records(input_path):
+-            for ax, ay, az, gx, gy, gz in frames:
+-                writer.writerow([record_number, timestamp, ax, ay, az, gx, gy, gz])
+-
+-
+-def main() -> None:
+-    parser = argparse.ArgumentParser(
+-        description="Convert base64 IMU record dump into CSV rows."
+-    )
+-    parser.add_argument("input", type=Path, help="Path to the base64 .bin file produced by start_stop_rec_ses.py")
+-    parser.add_argument(
+-        "--output",
+-        type=Path,
+-        help="Destination CSV path (defaults to <input>.csv)",
+-    )
+-    args = parser.parse_args()
+-
+-    output_path = args.output or args.input.with_suffix(".csv")
+-    convert_to_csv(args.input, output_path)
+-    print(f"Wrote {output_path}")
+-
+-
+-if __name__ == "__main__":
+-    main()
++    aux_offset = 16 + RAW_FRAMES_PER_RECORD * 18
++    aux_timestamp = int.from_bytes(payload[aux_offset : aux_offset + 8], byteorder="little", signed=False)
++    aux_offset += 8
++    pressure_pa_x10 = int.from_bytes(payload[aux_offset : aux_offset + 4], byteorder="little", signed=True)
++    aux_offset += 4
++    pressure_temp_cC = int.from_bytes(payload[aux_offset : aux_offset + 2], byteorder="little", signed=True)
++    aux_offset += 2
++    ir_object_temp_cC = int.from_bytes(payload[aux_offset : aux_offset + 2], byteorder="little", signed=True)
++    aux_offset += 2
++    ir_ambient_temp_cC = int.from_bytes(payload[aux_offset : aux_offset + 2], byteorder="little", signed=True)
++    aux_offset += 2
++    mag_uT_x = int.from_bytes(payload[aux_offset : aux_offset + 2], byteorder="little", signed=True)
++    aux_offset += 2
++    mag_uT_y = int.from_bytes(payload[aux_offset : aux_offset + 2], byteorder="little", signed=True)
++    aux_offset += 2
++    mag_uT_z = int.from_bytes(payload[aux_offset : aux_offset + 2], byteorder="little", signed=True)
++    aux_offset += 2
++    aux_flags = int.from_bytes(payload[aux_offset : aux_offset + 2], byteorder="little", signed=False)
++
++    return (
++        version,
++        record_num,
++        timestamp,
++        tuple(frames),
++        {
++            "aux_timestamp": aux_timestamp,
++            "pressure_pa_x10": pressure_pa_x10,
++            "pressure_temp_cC": pressure_temp_cC,
++            "ir_object_temp_cC": ir_object_temp_cC,
++            "ir_ambient_temp_cC": ir_ambient_temp_cC,
++            "mag_uT_x": mag_uT_x,
++            "mag_uT_y": mag_uT_y,
++            "mag_uT_z": mag_uT_z,
++            "aux_flags": aux_flags,
++        },
++    )
++
++
++def detect_input_format(path: Path) -> str:
++    """Return 'binary' or 'base64' depending on the file contents."""
++    with path.open("rb") as infile:
++        sample_bytes = infile.read(max(RECORD_FRAME_LENGTH, 128))
++    if not sample_bytes:
++        raise ValueError(f"{path} is empty")
++
++    stripped = sample_bytes.lstrip()
++    if not stripped:
++        raise ValueError(f"{path} only contains whitespace")
++
++    if stripped[0] == SOH:
++        return "binary"
++
++    first_line = None
++    try:
++        with path.open("r", encoding="utf-8") as infile:
++            for line in infile:
++                candidate = line.strip()
++                if candidate:
++                    first_line = candidate
++                    break
++    except UnicodeDecodeError:
++        first_line = None
++
++    if first_line:
++        try:
++            decoded = base64.b64decode(first_line, validate=True)
++        except base64.binascii.Error:
++            pass
++        else:
++            if decoded and decoded[0] == SOH and len(decoded) == RECORD_FRAME_LENGTH:
++                return "base64"
++
++    total_size = path.stat().st_size
++    if total_size % RECORD_FRAME_LENGTH == 0:
++        return "binary"
++
++    raise ValueError(f"Unable to determine format for {path}")
++
++
++def iter_records_base64(path: Path) -> Iterator[Tuple[int, int, int, Tuple[Tuple[int, ...], ...], Dict[str, int]]]:
++    with path.open("r", encoding="utf-8") as infile:
++        for line_number, line in enumerate(infile, start=1):
++            stripped = line.strip()
++            if not stripped:
++                continue
++            try:
++                frame = base64.b64decode(stripped)
++            except base64.binascii.Error as exc:  # noqa: B904
++                raise ValueError(f"Line {line_number}: invalid base64 data") from exc
++            try:
++                yield parse_record(frame)
++            except ValueError as exc:
++                raise ValueError(f"Line {line_number}: {exc}") from exc
++
++
++def iter_records_binary(path: Path) -> Iterator[Tuple[int, int, int, Tuple[Tuple[int, ...], ...], Dict[str, int]]]:
++    with path.open("rb") as infile:
++        for index in itertools.count():
++            frame = infile.read(RECORD_FRAME_LENGTH)
++            if not frame:
++                break
++            if len(frame) != RECORD_FRAME_LENGTH:
++                raise ValueError(
++                    f"Record {index}: expected {RECORD_FRAME_LENGTH} bytes, got {len(frame)}"
++                )
++            yield parse_record(frame)
++
++
++def iter_records(path: Path) -> Iterator[Tuple[int, int, int, Tuple[Tuple[int, ...], ...], Dict[str, int]]]:
++    input_format = detect_input_format(path)
++    if input_format == "binary":
++        yield from iter_records_binary(path)
++    else:
++        yield from iter_records_base64(path)
++
++
++def sensor_output_paths(base_path: Path) -> Dict[str, Path]:
++    return {
++        "imu": base_path.with_name(f"{base_path.name}_imu.csv"),
++        "pressure": base_path.with_name(f"{base_path.name}_pressure.csv"),
++        "magnetometer": base_path.with_name(f"{base_path.name}_magnetometer.csv"),
++        "infrared": base_path.with_name(f"{base_path.name}_infrared.csv"),
++    }
++
++
++def convert_to_csvs(input_path: Path, output_base_path: Path, annotate: bool) -> Dict[str, Path]:
++    output_base_path.parent.mkdir(parents=True, exist_ok=True)
++    output_paths = sensor_output_paths(output_base_path)
++
++    with ExitStack() as stack:
++        imu_writer = csv.writer(
++            stack.enter_context(output_paths["imu"].open("w", encoding="utf-8", newline=""))
++        )
++        pressure_writer = csv.writer(
++            stack.enter_context(output_paths["pressure"].open("w", encoding="utf-8", newline=""))
++        )
++        magnetometer_writer = csv.writer(
++            stack.enter_context(output_paths["magnetometer"].open("w", encoding="utf-8", newline=""))
++        )
++        infrared_writer = csv.writer(
++            stack.enter_context(output_paths["infrared"].open("w", encoding="utf-8", newline=""))
++        )
++
++        imu_header = [
++            "record_version",
++            "record_number",
++            "record_timestamp",
++            "sample_index",
++            "ax",
++            "ay",
++            "az",
++            "gx",
++            "gy",
++            "gz",
++            "aux_flags",
++        ]
++        if annotate:
++            imu_header.extend(["record_timestamp_iso", "record_delta_ms"])
++
++        pressure_header = [
++            "record_version",
++            "record_number",
++            "record_timestamp",
++            "aux_timestamp",
++            "pressure_pa_x10",
++            "pressure_temp_cC",
++            "aux_flags",
++        ]
++        if annotate:
++            pressure_header.extend(["record_timestamp_iso", "record_delta_ms", "aux_timestamp_iso"])
++
++        magnetometer_header = [
++            "record_version",
++            "record_number",
++            "record_timestamp",
++            "aux_timestamp",
++            "mag_uT_x",
++            "mag_uT_y",
++            "mag_uT_z",
++            "aux_flags",
++        ]
++        if annotate:
++            magnetometer_header.extend(["record_timestamp_iso", "record_delta_ms", "aux_timestamp_iso"])
++
++        infrared_header = [
++            "record_version",
++            "record_number",
++            "record_timestamp",
++            "aux_timestamp",
++            "ir_object_temp_cC",
++            "ir_ambient_temp_cC",
++            "aux_flags",
++        ]
++        if annotate:
++            infrared_header.extend(["record_timestamp_iso", "record_delta_ms", "aux_timestamp_iso"])
++
++        imu_writer.writerow(imu_header)
++        pressure_writer.writerow(pressure_header)
++        magnetometer_writer.writerow(magnetometer_header)
++        infrared_writer.writerow(infrared_header)
++
++        last_timestamp = None
++
++        for version, record_number, timestamp, frames, aux in iter_records(input_path):
++            record_iso = ""
++            delta_ms = 0
++            aux_iso = ""
++
++            if annotate:
++                record_iso = datetime.fromtimestamp(timestamp / 1000, tz=timezone.utc).isoformat()
++                if last_timestamp is not None:
++                    delta_ms = timestamp - last_timestamp
++                if aux["aux_timestamp"]:
++                    aux_iso = datetime.fromtimestamp(
++                        aux["aux_timestamp"] / 1000, tz=timezone.utc
++                    ).isoformat()
++            last_timestamp = timestamp
++
++            for sample_index, (ax, ay, az, gx, gy, gz) in enumerate(frames):
++                imu_row = [
++                    version,
++                    record_number,
++                    timestamp,
++                    sample_index,
++                    ax,
++                    ay,
++                    az,
++                    gx,
++                    gy,
++                    gz,
++                    aux["aux_flags"],
++                ]
++                if annotate:
++                    imu_row.extend([record_iso, delta_ms])
++                imu_writer.writerow(imu_row)
++
++            pressure_row = [
++                version,
++                record_number,
++                timestamp,
++                aux["aux_timestamp"],
++                aux["pressure_pa_x10"],
++                aux["pressure_temp_cC"],
++                aux["aux_flags"],
++            ]
++            if annotate:
++                pressure_row.extend([record_iso, delta_ms, aux_iso])
++            pressure_writer.writerow(pressure_row)
++
++            magnetometer_row = [
++                version,
++                record_number,
++                timestamp,
++                aux["aux_timestamp"],
++                aux["mag_uT_x"],
++                aux["mag_uT_y"],
++                aux["mag_uT_z"],
++                aux["aux_flags"],
++            ]
++            if annotate:
++                magnetometer_row.extend([record_iso, delta_ms, aux_iso])
++            magnetometer_writer.writerow(magnetometer_row)
++
++            infrared_row = [
++                version,
++                record_number,
++                timestamp,
++                aux["aux_timestamp"],
++                aux["ir_object_temp_cC"],
++                aux["ir_ambient_temp_cC"],
++                aux["aux_flags"],
++            ]
++            if annotate:
++                infrared_row.extend([record_iso, delta_ms, aux_iso])
++            infrared_writer.writerow(infrared_row)
++
++    return output_paths
++
++
++def main() -> None:
++    parser = argparse.ArgumentParser(
++        description="Convert captured IMU record dumps into per-sensor CSV files."
++    )
++    parser.add_argument(
++        "input",
++        type=Path,
++        help="Path to the .bin file produced by start_stop_rec_ses.py",
++    )
++    parser.add_argument(
++        "--output",
++        type=Path,
++        help="Base path for generated CSV files (defaults to <input> without suffix)",
++    )
++    parser.add_argument(
++        "--annotate",
++        action="store_true",
++        help="Include ISO8601 timestamps and inter-record delta (ms) columns",
++    )
++    args = parser.parse_args()
++
++    if args.output:
++        output_base = args.output
++    else:
++        output_base = args.input.with_suffix("")
++
++    if output_base.suffix:
++        output_base = output_base.with_suffix("")
++
++    output_paths = convert_to_csvs(args.input, output_base, args.annotate)
++    print("Wrote:")
++    for sensor, path in output_paths.items():
++        print(f"  {sensor}: {path}")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/tools/python/start_stop_rec_ses.py b/tools/python/start_stop_rec_ses.py
+index 61f5608..1e740f6 100644
+--- a/tools/python/start_stop_rec_ses.py
++++ b/tools/python/start_stop_rec_ses.py
+@@ -28,26 +28,29 @@ GET_RESPONSE_LENGTH = 0x0F
+ SET_FRAME_LENGTH = 0x0E
+ SET_RESPONSE_LENGTH = 0x08
+ RECORD_FRAME_LENGTH = 0x0F
+-RECORD_RESPONSE_LENGTH = 0x08
+-RECORD_START = 0x01
+-RECORD_STOP = 0x00
+-
+-READ_DETAILS_COMMAND_ID = 0x11
+-READ_DETAILS_FRAME_LENGTH = 0x0F
+-READ_DETAILS_RESPONSE_LENGTH = 0x11
+-DETAILS_DELAY_S = 1.0
+-READ_DATA_COMMAND_ID = 0x12
+-READ_DATA_FRAME_LENGTH = 0x13
+-READ_DATA_RESERVED_BYTES = 3
++RECORD_RESPONSE_LENGTH = 0x08
++RECORD_START = 0x01
++RECORD_STOP = 0x00
++
++READ_DETAILS_COMMAND_ID = 0x11
++READ_DETAILS_FRAME_LENGTH = 0x0F
++READ_DETAILS_RESPONSE_LENGTH = 0x11
++DETAILS_DELAY_S = 1.0
++DETAILS_EXTRA_DELAY_S = 2.0
++READ_DATA_COMMAND_ID = 0x12
++READ_DATA_FRAME_LENGTH = 0x13
++READ_DATA_RESPONSE_LENGTH = 0x08
++READ_DATA_RESERVED_BYTES = 3
++RAW_RECORD_FRAME_LEN = 1 + 224 + 2  # SOH + payload + CRC
+ WRITE_CHAR_UUID = "6765A69D-CD79-4DF6-AAD5-043DF9425556"  # ble_app/ble_profile.c:cat_tx_char_serv
+ READ_CHAR_UUID = "B6AB2CE3-A5AA-436A-817A-CC13A45AAB76"  # ble_app/ble_profile.c:cat_rx_char_serv
+ 
+ 
+-def crc16_modbus(payload: Sequence[int]) -> int:
+-    """Return Modbus CRC-16 for the provided payload."""
+-    crc = 0xFFFF
+-    for value in payload:
+-        crc ^= value
++def crc16_modbus(payload: Sequence[int]) -> int:
++    """Return Modbus CRC-16 for the provided payload."""
++    crc = 0xFFFF
++    for value in payload:
++        crc ^= value
+         for _ in range(8):
+             if crc & 1:
+                 crc = (crc >> 1) ^ 0xA001
+@@ -202,13 +205,26 @@ def build_read_data_command(uid: int, record_index: int) -> bytes:
+     frame_without_crc[1] = READ_DATA_FRAME_LENGTH
+ 
+     crc = crc16_modbus(frame_without_crc)
+-    frame_without_crc.extend(crc.to_bytes(2, byteorder="big"))
+-    return bytes(frame_without_crc)
+-
+-
+-
+-def format_uid(uid: int) -> str:
+-    return f"0x{uid:016X}"
++    frame_without_crc.extend(crc.to_bytes(2, byteorder="big"))
++    return bytes(frame_without_crc)
++
++
++
++def validate_raw_record(frame: bytes) -> None:
++    """Ensure a raw data frame is well-formed before writing it out."""
++    if len(frame) != RAW_RECORD_FRAME_LEN or frame[0] != 0x02:
++        raise ValueError(f"Unexpected frame length/start for raw data: {len(frame)} bytes")
++
++    received_crc = int.from_bytes(frame[-2:], byteorder="big")
++    calculated_crc = crc16_modbus(frame[:-2])
++    if received_crc != calculated_crc:
++        raise ValueError(
++            f"Raw record CRC mismatch: received 0x{received_crc:04X}, expected 0x{calculated_crc:04X}"
++        )
++
++
++def format_uid(uid: int) -> str:
++    return f"0x{uid:016X}"
+ 
+ 
+ def format_hex(frame: bytes) -> str:
+@@ -296,26 +312,68 @@ async def run_sequence(
+         print(f"Recording stopped (UID {session_uid}, stop time {stop_time_ms}).")
+ 
+         await asyncio.sleep(DETAILS_DELAY_S)
+-        print("Reading recording session details...")
+-        read_command = build_read_details_command(session_uid)
+-        await client.write_gatt_char(write_uuid, read_command, response=True)
+-        await asyncio.sleep(delay_s)
+-        read_response = await client.read_gatt_char(read_uuid)
+-        records = parse_read_details_response(bytes(read_response), session_uid)
+-        print(f"Details UID: {format_uid(session_uid)}, records in session: {records}")
++        print("Reading recording session details...")
++        await asyncio.sleep(DETAILS_EXTRA_DELAY_S)
++        read_command = build_read_details_command(session_uid)
++        await client.write_gatt_char(write_uuid, read_command, response=True)
++        await asyncio.sleep(delay_s)
++
++        records = None
++        for attempt in range(5):
++            read_response = await client.read_gatt_char(read_uuid)
++            frame = bytes(read_response)
++            if len(frame) >= 4 and frame[3] != READ_DETAILS_COMMAND_ID:
++                if (
++                    len(frame) == RECORD_RESPONSE_LENGTH
++                    and frame[3] == RECORD_COMMAND_ID
++                    and frame[4] == ACK_SUCCESS
++                ):
++                    await asyncio.sleep(delay_s)
++                    continue
++            records = parse_read_details_response(frame, session_uid)
++            break
++        if records is None:
++            print("Warning: session details not available; defaulting to zero records")
++            records = 0
++        else:
++            print(f"Details UID: {format_uid(session_uid)}, records in session: {records}")
+ 
+         output_path = f"{format_uid(session_uid)}.bin"
+-        with open(output_path, "w", encoding="utf-8") as out_file:
+-            for record_index in range(records):
+-                read_data_command = build_read_data_command(session_uid, record_index)
+-                await client.write_gatt_char(write_uuid, read_data_command, response=True)
+-                await asyncio.sleep(delay_s)
+-                data_response = await client.read_gatt_char(read_uuid)
+-                encoded = base64.b64encode(bytes(data_response)).decode("ascii")
+-                out_file.write(encoded + "\n")
+-                print(
+-                    f"Record {record_index}: {len(data_response)} bytes -> {format_hex(bytes(data_response))}"
+-                )
++        with open(output_path, "w", encoding="utf-8") as out_file:
++            record_index = 0
++            while True:
++                if records and record_index >= records:
++                    break
++
++                read_data_command = build_read_data_command(session_uid, record_index)
++                await client.write_gatt_char(write_uuid, read_data_command, response=True)
++                await asyncio.sleep(delay_s)
++
++                data_response = await client.read_gatt_char(read_uuid)
++                frame = bytes(data_response)
++
++                if len(frame) == READ_DATA_RESPONSE_LENGTH and len(frame) >= 5:
++                    if frame[3] == READ_DATA_COMMAND_ID and frame[4] == ACK_SUCCESS:
++                        if not records:
++                            break
++                        await asyncio.sleep(delay_s)
++                        continue
++                    if frame[3] == RECORD_COMMAND_ID and frame[4] == ACK_SUCCESS:
++                        break
++
++                try:
++                    validate_raw_record(frame)
++                except ValueError as exc:
++                    print(f"Warning: skipping malformed frame at index {record_index}: {exc}")
++                    break
++
++                encoded = base64.b64encode(frame).decode("ascii")
++                out_file.write(encoded + "\n")
++                print(
++                    f"Record {record_index}: {len(frame)} bytes -> {format_hex(frame)}"
++                )
++
++                record_index += 1
+ 
+         print(f"Saved base64 records to {output_path}")
+ 
+diff --git a/wifi_app/wifi_app.c b/wifi_app/wifi_app.c
+index 452b675..63aefc7 100644
+--- a/wifi_app/wifi_app.c
++++ b/wifi_app/wifi_app.c
+@@ -16,6 +16,8 @@
+ #include "common.h"
+ #include "wifi_app.h"
+ 
++#define ENABLE_WIFI_APP_THREAD 0
++
+ static osSemaphoreId_t wlan_thread_sem;
+ 
+ #define DHCP_HOST_NAME    "PetCat"
+@@ -444,6 +446,7 @@ int rsi_wifi_task_init()
+       app_log_error("Failed to get mac address: 0x%lx\r\n", status);
+     }
+ 
++#if ENABLE_WIFI_APP_THREAD
+     if (osThreadNew((osThreadFunc_t)wifi_app_task, NULL, &wifi_thread_attributes) == NULL) {
+         app_log_error("Failed to create wifi thread\r\n");
+         return -1;
+@@ -452,7 +455,7 @@ int rsi_wifi_task_init()
+     printf("\r\n Wi-Fi initialization is successful\r\n");
+ 
+     wifi_app_set_event(WIFI_EVENT_INITIAL);
+-    
++#endif
++
+     return 0;
+ }
+-
