@@ -1,0 +1,2 @@
+
+This folder contains the releases planned for the HS monticello project
