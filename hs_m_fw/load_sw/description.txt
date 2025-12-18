@@ -1,0 +1,4 @@
+
+ We have received a firmware from Brian on 18 dec 2025
+   it is having a loadcell sw at port 2.2
+   it was set and cleared after a interval. This code hex file is placed here.
