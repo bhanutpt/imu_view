@@ -1,0 +1,3 @@
+
+The folder shared to cg resource on cat collar KT
+  the entire git repo of the development, summary of the changes done in the project
