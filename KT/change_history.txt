@@ -1,0 +1,92 @@
+
+Detailed Change History (573f3d7 -> develop)
+- Comparison is from initial import commit 573f3d7 to develop tip 2bebdcf.
+
+File: app.c
+Wi-Fi initialization is now wrapped by a compile-time flag (ENABLE_WIFI_STACK) so firmware can
+boot without bringing up the Wi-Fi stack when it is not needed. Sensor bring-up has been
+expanded: spa06 (pressure) and bmm350 (magnetometer) are initialized, and MLX90632 (IR) is
+started with explicit error logging on failure. This reflects the shift toward logging multiple
+sensor modalities alongside IMU data.
+
+File: main.c
+Only a formatting change (added blank line) with no functional impact. This indicates no
+behavior change, just a small readability tweak.
+
+File: filesystem/storage_api.c
+Raw IMU record writes now check for partial writes in addition to outright failures. If the
+filesystem write returns fewer bytes than expected, an error is logged and the write is
+rejected. This hardens logging integrity and prevents silently corrupt records when flash
+writes are short.
+
+File: filesystem/storage_api.h
+The raw record layout was expanded and versioned (RAW_IMU_RECORD_VERSION=2). The struct now
+carries a base timestamp for the IMU batch, auxiliary snapshot data (pressure, temperature, IR
+temps, magnetometer), and a flags bitmask indicating which auxiliary fields are valid. This
+supports multi-sensor capture while maintaining backward-compatibility via a version field.
+
+File: sensor_data_service/chekr_record.c
+This file was significantly reworked to decouple IMU sampling from flash writes. A FreeRTOS
+queue and a dedicated writer task were added so the IMU callback only enqueues records while
+the writer task performs filesystem writes and logs throughput. The record format now includes
+versioning, base timestamps, and auxiliary sensor fields populated from a shared snapshot. An
+auxiliary snapshot subsystem was added to periodically read pressure, magnetometer, and
+infrared sensors and annotate the IMU records with these readings and flags. Start/stop
+recording now creates and tears down the queue/task cleanly, drains pending writes on stop, and
+warns on dropped records. The BLE read-back path now reads raw_imu_record_t instead of the
+older activity_record_t to align with the new record format.
+
+File: sensor_data_service/chekr_record.h
+The recording sample rate was increased to 60 Hz (IMU_ODR_60_HZ) to match the updated IMU
+configuration and higher-rate data capture.
+
+File: sensor_data_service/imu_service.c
+IMU timestamping was revised to produce stable, monotonic timestamps based on the sample period
+rather than reading wall time every sample. Remainder accumulation logic was added so
+fractional milliseconds from 1000/rate are preserved across samples, improving long-run timing
+accuracy. The task delay path mirrors this remainder logic to keep scheduling aligned, and
+debug logging was added for early samples. Task stop/start flow now uses FreeRTOS delays
+consistently and resets per-run state.
+
+File: sensor_driver/bmm350.c
+The magnetometer driver now uses a lower ODR (12.5 Hz) and adds a helper to read compensated
+magnetic field values in centi-microtesla. This provides a clean API for periodic magnetometer
+snapshots used in the logging pipeline, and the math helper rounds values consistently.
+
+File: sensor_driver/bmm350.h
+Updated headers to include stdbool/stdint and declare the new bmm350_read_field API so other
+modules can query magnetometer data without duplicating conversion logic.
+
+File: sensor_driver/common_i2c.c
+I2C access is now serialized with a FreeRTOS mutex (INSTANCE_ONE), ensuring thread-safe sensor
+reads when multiple tasks access the bus. The mutex is created in platform_i2c_init and
+locked/unlocked around each I2C read/write function, with error logging if lock acquisition
+fails. This reduces race conditions and bus contention in multi-threaded sampling.
+
+File: sensor_driver/lsm6dsv.c
+The LSM6DSV accelerometer/gyro data rate was raised from 15 Hz to 60 Hz, matching the new
+recording sample rate and improved temporal resolution for IMU logging.
+
+File: spiflash/spi_flash.c
+The GSPI bitrate was doubled to 40 MHz. This increases flash transfer speed and helps
+accommodate higher logging throughput from the faster sampling and larger record size.
+
+File: tools/python/convert_records_to_csv.py
+The conversion tool was overhauled for the new record format (frame length 227 bytes, versioned
+payload). It now detects whether input is raw binary or base64, parses the auxiliary sensor
+fields, and outputs separate CSV files for IMU, pressure, magnetometer, and IR data. Optional
+annotation adds ISO timestamps and inter-record deltas for easier analysis. This aligns the
+desktop tools with the expanded on-device logging format.
+
+File: tools/python/start_stop_rec_ses.py
+BLE session tooling now handles the updated raw record size and validates each frameâs CRC
+before writing it out. A retry loop and extra delay were added when reading session details,
+and the data read loop now recognizes ACK frames, stops cleanly when records are exhausted, and
+skips malformed frames with warnings. This improves robustness when pulling larger datasets
+over BLE.
+
+File: wifi_app/wifi_app.c
+Added a compile-time flag (ENABLE_WIFI_APP_THREAD) to disable the Wi-Fi app thread creation and
+event scheduling while still allowing Wi-Fi stack initialization. This provides flexibility for
+builds that need BLE-only or reduced Wi-Fi activity.
+

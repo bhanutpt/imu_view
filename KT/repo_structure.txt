@@ -1,0 +1,35 @@
+
+yq-catcollar-mainboard Repo Summary (KT)
+
+Repository structure (from AGENTS.md)
+- Core tasks orchestration: app.c, main.c
+- Shared helpers: common.c, common.h
+- Wireless split: ble_app/ (BLE), wifi_app/ (Wi-Fi)
+- HTTP/event glue: sensor_data_service/, sensor_driver/
+- Persistent assets: filesystem/ (LittleFS, OTA), resources/ (docs images)
+- Auto-generated config: autogen/, config/ (regenerate via Simplicity Studio or slc)
+- SDK dependencies: simplicity_sdk_2025.6.0/, wiseconnect3_sdk_3.5.0/ (read-only)
+Branches (git branch -a)
+- master @ 6890fff: baseline vendor import plus gitignore cleanup
+- develop @ 2bebdcf: main development line (latest release on this repo)
+- develop_scratch (HEAD): local scratch branch with an extra patch commit
+Changes since initial import (573f3d7 -> develop)
+Commits:
+- 6890fff chore: tighten gitignore
+- 62fdcdc feat: raise imu sampling to 60hz
+- 8f93865 feat: decouple imu sampling from flash writes
+- 4d0801c chore: snapshot before experiments
+- 2bebdcf feat: stabilize sensor logging
+Diff summary:
+- 19 files changed, 1173 insertions(+), 322 deletions(-)
+- Major modified areas:
+- sensor_data_service/chekr_record.c and imu_service.c: logging workflow and sampling flow
+- filesystem/storage_api.c/.h and spiflash/spi_flash.c: storage/flash integration updates
+- sensor_driver/* (bmm350, lsm6dsv, common_i2c): sensor driver adjustments
+- tools/python/*: record conversion and session tooling updates
+- app.c, main.c, wifi_app/wifi_app.c: application-level integration changes
+- .gitignore and .vscode/settings.json: repo hygiene / tooling
+Notes and assumptions
+- "latest release" is interpreted as the tip of develop (2bebdcf).
+
+
